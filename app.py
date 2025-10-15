@@ -1,471 +1,427 @@
-# -*- coding: utf-8 -*-
-"""
-App Streamlit : Validation & Visualisation des détours (GTFS-realtime TripModifications) + GTFS
-
-Fonctions :
-- Upload GTFS (.zip) + TripModifications (.pb/.json/.proto)
-- Parsing Protobuf (binaire) ou JSON -> message TripModifications
-- Validation sémantique minimale (selected_trips, service_dates, modifications)
-- Reconstruit le trajet de base (shapes.txt) et la géométrie du détour (Shape ou ReplacementStops)
-- Affiche "trajet vs détour" sur une carte Altair
-
-Prérequis :
-- Fichier local 'gtfs_realtime_pb2.py' (généré avec protoc depuis le proto officiel GTFS-rt)
-- requirements.txt : streamlit, altair, pandas, protobuf
-
-Références :
-- Proto officiel GTFS‑rt (inclut TripModifications/Shape/ReplacementStop, statut expérimental) :
-  https://gtfs.org/documentation/realtime/proto/
-- Référence sémantique "Trip Modifications" :
-  https://gtfs.org/documentation/realtime/feed-entities/trip-modifications/
-- Altair & GeoJSON/mark_geoshape dans Streamlit (recommandations & workaround) :
-  https://stackoverflow.com/questions/55923300/how-can-i-make-a-map-using-geojson-data-in-altair
-"""
-
+# app.py
 from __future__ import annotations
-
-import re
-import io
-import json
-import re
-import zipfile
+import json, csv, argparse, dataclasses, sys, io, zipfile
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Any, Dict, Tuple
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
-import altair as alt
-import pandas as pd
-import streamlit as st
-
-# ⚠️ IMPORTANT : import LOCAL (fichier généré par protoc, versionné dans le repo)
-import gtfs_realtime_pb2  # noqa: E402
-
-# Utilitaires Protobuf JSON <-> Message
-from google.protobuf.json_format import ParseDict  # noqa: E402
-
-
-# ------------------------------------------------------------------------------
-# Configuration de la page
-# ------------------------------------------------------------------------------
-st.set_page_config(page_title="TripModifications (GTFS-rt) + Carte des détours", layout="wide")
-
-
-# ------------------------------------------------------------------------------
-# Utilitaires GTFS
-# ------------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def read_gtfs_tables(gtfs_zip: bytes) -> Dict[str, pd.DataFrame]:
-    """Lit routes/trips/stops/shapes depuis un GTFS .zip."""
-    with zipfile.ZipFile(io.BytesIO(gtfs_zip)) as z:
-        def rd(name, dtype=None):
-            with z.open(name) as f:
-                return pd.read_csv(f, dtype=dtype)
-
-        trips = rd("trips.txt", dtype=str)
-        routes = rd("routes.txt", dtype=str)
-        stops = rd("stops.txt", dtype=str)
-        shapes = rd("shapes.txt", dtype={"shape_id": str, "shape_pt_lat": float,
-                                         "shape_pt_lon": float, "shape_pt_sequence": int})
-
-    shapes = shapes.sort_values(["shape_id", "shape_pt_sequence"])
-    return {"trips": trips, "routes": routes, "stops": stops, "shapes": shapes}
-
-_CAMEL_TO_SNAKE_RE_1 = re.compile('(.)([A-Z][a-z]+)')
-_CAMEL_TO_SNAKE_RE_2 = re.compile('([a-z0-9])([A-Z])')
-
-# Mapping explicite pour certains noms "officiels" du proto
-# (afin de gérer proprement serviceDates -> service_dates, etc.)
-JSON_FIELD_MAPPING = {
-    # Top-level TripModifications
-    "selectedTrips": "selected_trips",
-    "startTimes": "start_times",
-    "serviceDates": "service_dates",
-    "modifications": "modifications",
-
-    # SelectedTrips
-    "tripIds": "trip_ids",
-    "routeId": "route_id",
-    "directionId": "direction_id",
-
-    # Modification (détours)
-    "replacementStops": "replacement_stops",
-    "startStopSelector": "start_stop_selector",
-    "endStopSelector": "end_stop_selector",
-
-    # ReplacementStop
-    "stopId": "stop_id",
-    "travelTimeToStop": "travel_time_to_stop",
-
-    # Shape (RT)
-    "encodedPolyline": "encoded_polyline",
-    "shapeId": "shape_id",
-    # Points (si présents)
-    "shapePtLat": "shape_pt_lat",
-    "shapePtLon": "shape_pt_lon",
-
-    # Divers sélecteurs (parfois via EntitySelector équivalents)
-    "stopIdSelector": "stop_id_selector",  # par précaution
-}
-
-
-def camel_to_snake(name: str) -> str:
-    """Convertit lowerCamelCase/PascalCase vers snake_case."""
-    s1 = _CAMEL_TO_SNAKE_RE_1.sub(r'\1_\2', name)
-    return _CAMEL_TO_SNAKE_RE_2.sub(r'\1_\2', s1).lower()
-
-
-def normalize_keys(obj):
-    """
-    Normalise récursivement les clés de dict :
-      1) mapping explicite (JSON_FIELD_MAPPING)
-      2) camelCase -> snake_case
-    Conserve les listes telles quelles (en normalisant leur contenu).
-    """
-    if isinstance(obj, dict):
-        new_d = {}
-        for k, v in obj.items():
-            if k in JSON_FIELD_MAPPING:
-                nk = JSON_FIELD_MAPPING[k]
-            else:
-                nk = camel_to_snake(k)
-            new_d[nk] = normalize_keys(v)
-        return new_d
-    elif isinstance(obj, list):
-        return [normalize_keys(x) for x in obj]
-    else:
-        return obj
-
-def shape_id_for_trip(trips: pd.DataFrame, trip_id: str) -> Optional[str]:
-    row = trips.loc[trips["trip_id"] == str(trip_id)]
-    if not row.empty and "shape_id" in row:
-        return str(row.iloc[0]["shape_id"])
-    return None
-
-
-def polyline_for_shape(shapes: pd.DataFrame, shape_id: str) -> Optional[List[Tuple[float, float]]]:
-    segs = shapes.loc[shapes["shape_id"] == shape_id]
-    if segs.empty:
-        return None
-    return list(zip(segs["shape_pt_lon"].tolist(), segs["shape_pt_lat"].tolist()))
-
-
-def stops_lookup(stops: pd.DataFrame, stop_id: str) -> Optional[Tuple[float, float]]:
-    row = stops.loc[stops["stop_id"] == str(stop_id)]
-    if row.empty:
-        return None
-    return float(row.iloc[0]["stop_lon"]), float(row.iloc[0]["stop_lat"])
-
-
-# ------------------------------------------------------------------------------
-# Utilitaires GeoJSON/Polyline/Altair
-# ------------------------------------------------------------------------------
-def decode_google_polyline(polyline_str: str) -> List[Tuple[float, float]]:
-    """Décodage 'Google Encoded Polyline' -> [(lon, lat), ...]."""
-    coords = []
-    index, lat, lon = 0, 0, 0
-    length = len(polyline_str)
-
-    def _decode():
-        nonlocal index
-        result, shift = 0, 0
-        while True:
-            b = ord(polyline_str[index]) - 63
-            index += 1
-            result |= (b & 0x1F) << shift
-            shift += 5
-            if b < 0x20:
-                break
-        return ~(result >> 1) if (result & 1) else (result >> 1)
-
-    while index < length:
-        lat += _decode()
-        lon += _decode()
-        coords.append((lon / 1e5, lat / 1e5))
-    return coords
-
-
-def feature_line(coords: List[Tuple[float, float]], props: Dict[str, Any]) -> Dict[str, Any]:
-    return {"type": "Feature", "properties": props,
-            "geometry": {"type": "LineString", "coordinates": coords}}
-
-
-def fc(features: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {"type": "FeatureCollection", "features": features}
-
-
-# ------------------------------------------------------------------------------
-# Parsing & Validation TripModifications (réf. GTFS‑rt)
-# ------------------------------------------------------------------------------
-DATE_RE = re.compile(r"^\d{8}$")  # YYYYMMDD attendu
-
-def parse_trip_modifications_from_pb(pb_bytes: bytes) -> gtfs_realtime_pb2.TripModifications:
-    """Parse binaire .pb -> message TripModifications."""
-    msg = gtfs_realtime_pb2.TripModifications()
-    msg.ParseFromString(pb_bytes)
-    return msg
-
-
-def parse_trip_modifications_from_json(file_obj):
-    """Parse JSON -> message TripModifications en tolérant camelCase et snake_case."""
-    # 1) Charger le JSON brut
-    try:
-        tm_dict_raw = json.load(file_obj)
-    except Exception as e:
-        st.error(f"Erreur lecture JSON : {e}")
-        st.stop()
-
-    # 2) Normaliser les clés vers snake_case attendu par le proto
-    tm_dict_norm = normalize_keys(tm_dict_raw)
-
-    # 3) Tenter ParseDict sur la version normalisée
-    msg = gtfs_realtime_pb2.TripModifications()
-    try:
-        ParseDict(tm_dict_norm, msg, ignore_unknown_fields=True)
-        return msg, tm_dict_norm
-    except Exception as e_norm:
-        # 4) En fallback, tenter la version brute (si elle était déjà conforme)
-        try:
-            msg2 = gtfs_realtime_pb2.TripModifications()
-            ParseDict(tm_dict_raw, msg2, ignore_unknown_fields=True)
-            return msg2, tm_dict_raw
-        except Exception as e_raw:
-            expected = {"selected_trips", "service_dates", "modifications"}
-            present = set(tm_dict_norm.keys()) if isinstance(tm_dict_norm, dict) else set()
-            st.error(
-                "Le JSON ne correspond pas au schéma TripModifications.\n\n"
-                f"- Erreur (normalisé): {e_norm}\n"
-                f"- Erreur (brut)     : {e_raw}\n\n"
-                f"Clés attendues (indicatif): {sorted(expected)}\n"
-                f"Clés présentes top-level  : {sorted(present) if present else '—'}"
-            )
-            st.stop()
-
-
-def basic_validation(tm: gtfs_realtime_pb2.TripModifications) -> List[str]:
-    """Contrôles sémantiques minimaux recommandés (réf. Trip Modifications, statut expérimental)."""
-    issues = []
-    if len(tm.selected_trips) == 0:
-        issues.append("`selected_trips` est vide : aucun trip ciblé.")
-    if len(tm.service_dates) == 0:
-        issues.append("`service_dates` est vide : aucune date de validité.")
-    else:
-        bad = [d for d in tm.service_dates if not DATE_RE.match(d)]
-        if bad:
-            issues.append(f"`service_dates` mal formatés (YYYYMMDD attendu) : {', '.join(bad)}")
-    if len(tm.modifications) == 0:
-        issues.append("`modifications` est vide : aucune modification/détour fournie.")
-    return issues
-
-
-def infer_trip_ids_from_selected_trips(tm: gtfs_realtime_pb2.TripModifications,
-                                       trips: pd.DataFrame) -> List[str]:
-    """
-    Best-effort pour récupérer des trip_id depuis selected_trips (message expérimental).
-    Si le champ trip_ids existe -> on l'utilise ; sinon fallback route_id/direction_id.
-    """
-    trip_ids = set()
-    for sel in tm.selected_trips:
-        if hasattr(sel, "trip_ids") and len(sel.trip_ids) > 0:
-            for tid in sel.trip_ids:
-                trip_ids.add(str(tid))
-        else:
-            route_id = getattr(sel, "route_id", "")
-            direction_id = getattr(sel, "direction_id", None)
-            if route_id:
-                subset = trips.loc[trips["route_id"] == str(route_id)]
-                if direction_id in ("0", "1"):
-                    subset = subset.loc[subset["direction_id"] == str(direction_id)]
-                for tid in subset["trip_id"].tolist():
-                    trip_ids.add(str(tid))
-    return list(trip_ids)
-
-
-def extract_detour_geometry(modif: Any, stops_df: pd.DataFrame) -> Optional[List[Tuple[float, float]]]:
-    """
-    Produit une polyligne (lon, lat) pour la modification :
-      1) Shape.encoded_polyline si présent (message Shape du RT)
-      2) À défaut, chaînage des ReplacementStop (stop_id -> coordonnées de stops.txt)
-    """
-    # 1) Shape encodé
-    if hasattr(modif, "shape") and modif.HasField("shape"):
-        shp = modif.shape
-        if hasattr(shp, "encoded_polyline") and shp.encoded_polyline:
-            return decode_google_polyline(shp.encoded_polyline)
-        if hasattr(shp, "points") and len(shp.points) > 0:
-            coords = [(p.lon, p.lat) for p in shp.points]
-            if coords:
-                return coords
-
-    # 2) Replacement stops
-    if hasattr(modif, "replacement_stops") and len(modif.replacement_stops) > 0:
-        rs = list(modif.replacement_stops)
-        try:
-            rs.sort(key=lambda r: getattr(r, "travel_time_to_stop", 0))
-        except Exception:
-            pass
-        coords = []
-        for r in rs:
-            sid = getattr(r, "stop_id", "")
-            if sid:
-                xy = stops_lookup(stops_df, sid)
-                if xy:
-                    coords.append(xy)
-        if len(coords) >= 2:
-            return coords
-
-    return None
-
-
-# ------------------------------------------------------------------------------
-# UI — Upload, Parsing multi-formats, Validation, Carte
-# ------------------------------------------------------------------------------
-st.title("TripModifications (GTFS‑realtime) — Validation & Carte des détours")
-
-with st.sidebar:
-    st.header("Fichiers d’entrée")
-    gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
-    tm_file = st.file_uploader(
-        "TripModifications (.pb, .json, ou .proto)",
-        type=["pb", "bin", "pbf", "dat", "json", "proto"]
-    )
-    st.markdown("---")
-    base_color = st.color_picker("Couleur du trajet de base", "#888888")
-    detour_color = st.color_picker("Couleur du détour", "#d62728")
-    st.markdown("---")
-    with st.expander("Debug (chemin du module proto)"):
-        st.caption(f"gtfs_realtime_pb2 chargé depuis : {getattr(gtfs_realtime_pb2, '__file__', '???')}")
-
-if not gtfs_file or not tm_file:
-    st.info("Charge un **GTFS (.zip)** et un **TripModifications** (.pb recommandé).")
-    st.stop()
-
-# Lire GTFS
+################################################################################
+# 0) Import des bindings Protobuf locaux (gtfs_realtime_pb2.py à la racine)
+################################################################################
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))  # priorité au projet
 try:
-    gtfs = read_gtfs_tables(gtfs_file.read())
-    trips_df, routes_df, stops_df, shapes_df = gtfs["trips"], gtfs["routes"], gtfs["stops"], gtfs["shapes"]
-except Exception as e:
-    st.error(f"Erreur lecture GTFS : {e}")
-    st.stop()
+    import gtfs_realtime_pb2 as gtfs_local  # votre fichier local
+except Exception:
+    gtfs_local = None  # on tentera les bindings pip si nécessaire
 
-# Détection extension & parsing
-ext = Path(tm_file.name).suffix.lower()
-tm_msg: Optional[gtfs_realtime_pb2.TripModifications] = None
-tm_raw_dict: Optional[Dict[str, Any]] = None
 
-if ext in [".pb", ".bin", ".pbf", ".dat"]:
+################################################################################
+# 1) Modèle normalisé en mémoire
+################################################################################
+@dataclass
+class StopSelector:
+    stop_sequence: Optional[int] = None
+    stop_id: Optional[str] = None
+
+@dataclass
+class ReplacementStop:
+    stop_id: str
+    travel_time_to_stop: int = 0
+
+@dataclass
+class Modification:
+    start_stop_selector: Optional[StopSelector] = None
+    end_stop_selector: Optional[StopSelector] = None
+    replacement_stops: List[ReplacementStop] = field(default_factory=list)
+    propagated_modification_delay: Optional[int] = None
+
+@dataclass
+class SelectedTrips:
+    trip_ids: List[str] = field(default_factory=list)
+    shape_id: Optional[str] = None
+
+@dataclass
+class TripModEntity:
+    entity_id: str
+    selected_trips: List[SelectedTrips]
+    service_dates: List[str] = field(default_factory=list)
+    start_times: List[str] = field(default_factory=list)
+    modifications: List[Modification] = field(default_factory=list)
+
+
+################################################################################
+# 2) Utilitaires: détection JSON/PB, coercions
+################################################################################
+def _detect_tripmods_format(path: Path) -> str:
+    if path.suffix.lower() == '.json':
+        return 'json'
+    if path.suffix.lower() in ('.pb', '.pbf', '.bin'):
+        return 'pb'
+    head = path.read_bytes()[:2].lstrip()
+    return 'json' if head.startswith(b'{') or head.startswith(b'[') else 'pb'
+
+def _coerce_selector(obj: Dict[str, Any]) -> StopSelector:
+    if not isinstance(obj, dict):
+        return StopSelector()
+    seq = obj.get('stop_sequence')
+    sid = obj.get('stop_id') or None
     try:
-        tm_msg = parse_trip_modifications_from_pb(tm_file.read())
-        st.success(f"Binaire TripModifications chargé : {tm_file.name}")
-    except Exception as e:
-        st.error(f"Fichier non conforme (TripModifications .pb attendu) : {e}")
-        st.stop()
+        seq = int(seq) if seq is not None and f"{seq}".strip() != '' else None
+    except Exception:
+        seq = None
+    return StopSelector(stop_sequence=seq, stop_id=sid if (sid or None) else None)
 
-elif ext == ".json":
+def _coerce_repl_stop(obj: Dict[str, Any]) -> Optional[ReplacementStop]:
+    if not isinstance(obj, dict):
+        return None
+    sid = obj.get('stop_id')
+    if not sid:
+        return None
+    t = obj.get('travel_time_to_stop', 0)
     try:
-        tm_msg, tm_raw_dict = parse_trip_modifications_from_json(tm_file)
-        st.success(f"JSON TripModifications chargé : {tm_file.name}")
-        with st.expander("Aperçu JSON (normalisé)"):
-            st.json(tm_raw_dict)
-    except Exception as e:
-        st.error(f"Erreur lors du parsing JSON -> TripModifications : {e}")
-        st.stop()
+        t = int(t)
+    except Exception:
+        t = 0
+    return ReplacementStop(stop_id=str(sid), travel_time_to_stop=t)
 
-elif ext == ".proto":
-    preview = tm_file.read(4096).decode("utf-8", errors="ignore")
-    st.warning(
-        "Le fichier chargé est un **schéma Protobuf (.proto)** — pas un message TripModifications.\n"
-        "→ Compile-le localement en .pb ou en module Python, puis recharge le .pb pour l’analyse."
+def _coerce_selected_trips(obj: Dict[str, Any]) -> SelectedTrips:
+    trips = obj.get('trip_ids') or []
+    if isinstance(trips, str):
+        trips = [trips]
+    trips = [str(t).strip() for t in trips if str(t).strip()]
+    shape_id = obj.get('shape_id')
+    shape_id = str(shape_id) if shape_id not in (None, '') else None
+    return SelectedTrips(trip_ids=trips, shape_id=shape_id)
+
+
+################################################################################
+# 3) Parsing TripModifications (JSON et Protobuf)
+################################################################################
+def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
+    entities = feed.get('entity') or []
+    out: List[TripModEntity] = []
+    for e in entities:
+        tm = e.get('trip_modifications')
+        if not tm:
+            continue
+        sel_raw = tm.get('selected_trips') or []
+        selected = [_coerce_selected_trips(s) for s in sel_raw]
+
+        # Dates au niveau trip_modifications (sinon normalisation depuis selected_trips)
+        service_dates = tm.get('service_dates') or []
+        if not service_dates:
+            for s in sel_raw:
+                dates = s.get('service_dates')
+                if dates:
+                    service_dates.extend(dates)
+        service_dates = [str(d) for d in service_dates]
+
+        start_times = [str(t) for t in tm.get('start_times') or []]
+
+        mods: List[Modification] = []
+        for m in tm.get('modifications') or []:
+            repl_list = []
+            for rs in m.get('replacement_stops') or []:
+                r = _coerce_repl_stop(rs)
+                if r:
+                    repl_list.append(r)
+            start_sel = _coerce_selector(m.get('start_stop_selector') or {})
+            end_sel = _coerce_selector(m.get('end_stop_selector') or {})
+            mods.append(Modification(
+                start_stop_selector=start_sel,
+                end_stop_selector=end_sel,
+                replacement_stops=repl_list,
+                propagated_modification_delay=m.get('propagated_modification_delay')
+            ))
+
+        out.append(TripModEntity(
+            entity_id=str(e.get('id')),
+            selected_trips=selected,
+            service_dates=service_dates,
+            start_times=start_times,
+            modifications=mods
+        ))
+    return out
+
+
+def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
+    """
+    Utilise d'abord le gtfs_realtime_pb2.py local (racine du repo).
+    Si indisponible ou incompatible, tente les bindings pip (google.transit...).
+    """
+    proto = gtfs_local
+    if proto is None:
+        try:
+            from google.transit import gtfs_realtime_pb2 as proto  # fallback pip
+        except Exception as ex:
+            raise RuntimeError(
+                "Impossible d'importer les bindings Protobuf. "
+                "Placez `gtfs_realtime_pb2.py` à la racine ou installez "
+                "`gtfs-realtime-bindings` compatibles TripModifications."
+            ) from ex
+
+    feed = proto.FeedMessage()
+    feed.ParseFromString(data)
+
+    out: List[TripModEntity] = []
+    for ent in feed.entity:
+        if not hasattr(ent, 'trip_modifications'):
+            continue
+        tm = ent.trip_modifications
+
+        selected: List[SelectedTrips] = []
+        for s in getattr(tm, 'selected_trips', []):
+            trips = list(getattr(s, 'trip_ids', []))
+            shape_id = getattr(s, 'shape_id', None) or None
+            selected.append(SelectedTrips(trip_ids=trips, shape_id=shape_id))
+
+        service_dates = list(getattr(tm, 'service_dates', []))
+        start_times = list(getattr(tm, 'start_times', []))
+
+        mods: List[Modification] = []
+        for m in getattr(tm, 'modifications', []):
+            repl = [ReplacementStop(stop_id=rs.stop_id, travel_time_to_stop=int(getattr(rs, 'travel_time_to_stop', 0)))
+                    for rs in getattr(m, 'replacement_stops', [])]
+            if hasattr(m, 'start_stop_selector'):
+                start_sel = StopSelector(
+                    stop_sequence=getattr(m.start_stop_selector, 'stop_sequence', None),
+                    stop_id=getattr(m.start_stop_selector, 'stop_id', None),
+                )
+            else:
+                start_sel = StopSelector()
+            if hasattr(m, 'end_stop_selector'):
+                end_sel = StopSelector(
+                    stop_sequence=getattr(m.end_stop_selector, 'stop_sequence', None),
+                    stop_id=getattr(m.end_stop_selector, 'stop_id', None),
+                )
+            else:
+                end_sel = StopSelector()
+
+            mods.append(Modification(
+                start_stop_selector=start_sel,
+                end_stop_selector=end_sel,
+                replacement_stops=repl,
+                propagated_modification_delay=getattr(m, 'propagated_modification_delay', None)
+            ))
+
+        out.append(TripModEntity(
+            entity_id=str(getattr(ent, 'id', '')),
+            selected_trips=selected,
+            service_dates=service_dates,
+            start_times=start_times,
+            modifications=mods
+        ))
+    return out
+
+
+def load_tripmods(path: Path) -> List[TripModEntity]:
+    fmt = _detect_tripmods_format(path)
+    if fmt == 'json':
+        feed = json.loads(path.read_text(encoding='utf-8'))
+        return parse_tripmods_json(feed)
+    else:
+        data = path.read_bytes()
+        return parse_tripmods_protobuf(data)
+
+
+################################################################################
+# 4) Chargement GTFS statique (zip ou dossier) + index utiles
+################################################################################
+@dataclass
+class GtfsStatic:
+    trips: Dict[str, Dict[str, str]]                      # trip_id -> row
+    stop_times: Dict[str, List[Dict[str, str]]]           # trip_id -> [ {stop_sequence:int, stop_id:str, ...}, ... ]
+    stops: Dict[str, Dict[str, str]]                      # stop_id -> row
+
+def _read_csv(path_or_bytes: io.BytesIO | Path, fname: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    if isinstance(path_or_bytes, Path) and path_or_bytes.is_dir():
+        p = path_or_bytes / fname
+        if not p.exists():
+            return rows
+        with p.open('r', encoding='utf-8-sig', newline='') as f:
+            for row in csv.DictReader(f):
+                rows.append({k: (v or "").strip() for k, v in row.items()})
+        return rows
+
+    # zip
+    if isinstance(path_or_bytes, Path):
+        with zipfile.ZipFile(path_or_bytes, 'r') as zf:
+            if fname not in zf.namelist():
+                return rows
+            with zf.open(fname) as f:
+                text = io.TextIOWrapper(f, encoding='utf-8-sig', newline='')
+                for row in csv.DictReader(text):
+                    rows.append({k: (v or "").strip() for k, v in row.items()})
+        return rows
+
+    # not expected
+    return rows
+
+def load_gtfs(gtfs_path: str | Path) -> GtfsStatic:
+    p = Path(gtfs_path)
+    trips = {r['trip_id']: r for r in _read_csv(p, 'trips.txt') if 'trip_id' in r}
+    # stop_times triés par stop_sequence (int)
+    st_rows = _read_csv(p, 'stop_times.txt')
+    stop_times: Dict[str, List[Dict[str, str]]] = {}
+    for r in st_rows:
+        trip_id = r.get('trip_id')
+        if not trip_id:
+            continue
+        lst = stop_times.setdefault(trip_id, [])
+        # cast safe
+        try:
+            r['stop_sequence'] = str(int(r.get('stop_sequence', '').strip()))
+        except Exception:
+            r['stop_sequence'] = ''
+        lst.append(r)
+    for trip_id, lst in stop_times.items():
+        lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
+    stops = {r['stop_id']: r for r in _read_csv(p, 'stops.txt') if 'stop_id' in r}
+    return GtfsStatic(trips=trips, stop_times=stop_times, stops=stops)
+
+
+################################################################################
+# 5) Analyse TripModifications vs GTFS
+################################################################################
+@dataclass
+class TripCheck:
+    trip_id: str
+    exists_in_gtfs: bool
+    start_seq_valid: bool
+    end_seq_valid: bool
+    start_seq: Optional[int] = None
+    end_seq: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+@dataclass
+class EntityReport:
+    entity_id: str
+    total_selected_trip_ids: int
+    service_dates: List[str]
+    modification_count: int
+    trips: List[TripCheck]
+    replacement_stops_unknown_in_gtfs: List[str] = field(default_factory=list)
+
+def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]]) -> Optional[int]:
+    """Résout un stop_selector vers un stop_sequence (priorité au sequence, fallback par stop_id)."""
+    if sel is None:
+        return None
+    if sel.stop_sequence is not None:
+        return sel.stop_sequence
+    if sel.stop_id:
+        for r in stop_times_list:
+            if r.get('stop_id') == sel.stop_id:
+                try:
+                    return int(r.get('stop_sequence') or 0)
+                except Exception:
+                    return None
+    return None
+
+def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> Tuple[List[EntityReport], Dict[str, int]]:
+    reports: List[EntityReport] = []
+    totals = dict(total_entities=len(ents), total_trip_ids=0, total_modifications=0,
+                  missing_trip_ids=0, invalid_selectors=0, unknown_replacement_stops=0)
+
+    for e in ents:
+        trip_checks: List[TripCheck] = []
+        repl_unknown: List[str] = []
+        tot_trip_ids = sum(len(sel.trip_ids) for sel in e.selected_trips)
+
+        for sel in e.selected_trips:
+            for trip_id in sel.trip_ids:
+                exists = trip_id in gtfs.trips
+                st_list = gtfs.stop_times.get(trip_id, [])
+                start_ok = end_ok = False
+                start_seq = end_seq = None
+                notes: List[str] = []
+                if not exists:
+                    notes.append("trip_id absent du GTFS")
+                    totals["missing_trip_ids"] += 1
+                else:
+                    # on évalue sur TOUTES les modifications de l’entité (même si plusieurs)
+                    for m in e.modifications:
+                        sseq = _seq_from_selector(m.start_stop_selector, st_list) if st_list else None
+                        eseq = _seq_from_selector(m.end_stop_selector,   st_list) if st_list else None
+                        if start_seq is None and sseq is not None:
+                            start_seq = sseq
+                        if end_seq is None and eseq is not None:
+                            end_seq = eseq
+                        if sseq is None or eseq is None:
+                            notes.append("start/end selector non résolu sur ce trip")
+                            totals["invalid_selectors"] += 1
+                        else:
+                            start_ok = True
+                            end_ok = True
+                trip_checks.append(TripCheck(trip_id=trip_id, exists_in_gtfs=exists,
+                                             start_seq_valid=start_ok, end_seq_valid=end_ok,
+                                             start_seq=start_seq, end_seq=end_seq, notes=notes))
+
+        # replacement_stops (on signale ceux inconnus dans stops.txt; NB: des arrêts temporaires peuvent être normaux)
+        for m in e.modifications:
+            for rs in m.replacement_stops:
+                sid = rs.stop_id
+                if sid and sid not in gtfs.stops:
+                    repl_unknown.append(sid)
+                    totals["unknown_replacement_stops"] += 1
+
+        totals["total_trip_ids"] += tot_trip_ids
+        totals["total_modifications"] += len(e.modifications)
+
+        reports.append(EntityReport(
+            entity_id=e.entity_id,
+            total_selected_trip_ids=tot_trip_ids,
+            service_dates=e.service_dates,
+            modification_count=len(e.modifications),
+            trips=trip_checks,
+            replacement_stops_unknown_in_gtfs=sorted(set(repl_unknown))
+        ))
+
+    return reports, totals
+
+
+################################################################################
+# 6) CLI de l’app
+################################################################################
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Analyse GTFS + TripModifications (JSON ou PB)."
     )
-    with st.expander("Aperçu du .proto (4096 premiers octets)"):
-        st.code(preview, language="protobuf")
-    st.stop()
-else:
-    st.error(f"Extension non supportée : {ext}")
-    st.stop()
+    ap.add_argument("--gtfs", required=True, help="Chemin GTFS (.zip ou dossier)")
+    ap.add_argument("--tripmods", required=True, help="Chemin TripModifications (.json ou .pb)")
+    ap.add_argument("--report-json", default="", help="Fichier où écrire le rapport JSON (optionnel)")
+    ap.add_argument("--dump-first", action="store_true", help="Afficher le 1er trip_mod normalisé")
+    args = ap.parse_args(argv)
 
-# Validation sémantique minimale
-issues = basic_validation(tm_msg)
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Contrôles de conformité")
-    if issues:
-        for it in issues:
-            st.error("• " + it)
-    else:
-        st.success("Structure minimale OK (selected_trips, service_dates, modifications).")
-with col2:
-    st.subheader("Résumé")
-    st.write(f"- selected_trips : **{len(tm_msg.selected_trips)}**")
-    st.write(f"- service_dates  : **{len(tm_msg.service_dates)}**")
-    st.write(f"- modifications  : **{len(tm_msg.modifications)}**")
-    st.caption("Rappel : Trip Modifications est **expérimental** dans GTFS‑rt et peut évoluer.")
+    gtfs = load_gtfs(args.gtfs)
+    ents = load_tripmods(Path(args.tripmods))
 
-# Trip(s) impactés (pour tracer le trajet de base)
-impacted_trip_ids = infer_trip_ids_from_selected_trips(tm_msg, trips_df)
-if impacted_trip_ids:
-    st.info(f"Trip(s) impacté(s) détecté(s) : {', '.join(impacted_trip_ids[:10]) + ('…' if len(impacted_trip_ids)>10 else '')}")
-else:
-    st.warning("Aucun `trip_id` déduit de `selected_trips` — le trajet de base pourrait ne pas s’afficher.")
+    # Résumé console
+    print(f"Chargé: {len(gtfs.trips):,} trips, {sum(len(v) for v in gtfs.stop_times.values()):,} stop_times, {len(gtfs.stops):,} stops")
+    print(f"TripModifications: {len(ents)} entités")
+    if args.dump_first and ents:
+        print("\n--- 1er trip_mod (normalisé) ---")
+        print(json.dumps(asdict(ents[0]), ensure_ascii=False, indent=2))
 
-# Préparer la liste de détours cartographiables (une entrée par modification)
-detour_items = []
-for idx, modif in enumerate(tm_msg.modifications):
-    geom = extract_detour_geometry(modif, stops_df)
-    base_trip = impacted_trip_ids[0] if impacted_trip_ids else None
-    detour_items.append({"index": idx, "geom": geom, "base_trip_id": base_trip})
+    reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
 
-if not detour_items:
-    st.warning("Aucune modification exploitable pour la carte (Shape/ReplacementStops absents).")
-    st.stop()
+    print("\n=== Résumé ===")
+    print(f"- Entités: {totals['total_entities']}")
+    print(f"- trip_ids sélectionnés: {totals['total_trip_ids']}")
+    print(f"- modifications: {totals['total_modifications']}")
+    print(f"- trip_ids manquants: {totals['missing_trip_ids']}")
+    print(f"- selectors non résolus: {totals['invalid_selectors']}")
+    print(f"- replacement_stops inconnus dans GTFS: {totals['unknown_replacement_stops']} (peuvent être des arrêts temporaires)")
 
-labels = [f"Modification #{it['index']} — geom={'oui' if it['geom'] else 'non'} — base_trip_id={it['base_trip_id'] or '—'}"
-          for it in detour_items]
-sel = st.selectbox("Choisir une modification à visualiser", labels)
-sel_item = detour_items[labels.index(sel)]
+    if args.report_json:
+        out = {
+            "totals": totals,
+            "entities": [asdict(r) for r in reports]
+        }
+        Path(args.report_json).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\nRapport écrit: {args.report_json}")
 
-# Construire GeoJSON
-features = []
 
-# Trajet de base (shape depuis GTFS) si on a un trip_id
-if sel_item["base_trip_id"]:
-    sid = shape_id_for_trip(trips_df, sel_item["base_trip_id"])
-    if sid:
-        base_coords = polyline_for_shape(shapes_df, sid)
-        if base_coords:
-            features.append(feature_line(base_coords, {"kind": "base", "shape_id": sid}))
-    else:
-        st.warning("`shape_id` introuvable pour le trip représentatif.")
-
-# Détour (Shape RT ou ReplacementStops)
-if sel_item["geom"]:
-    features.append(feature_line(sel_item["geom"], {"kind": "detour", "mod_index": sel_item["index"]}))
-else:
-    st.warning("Pas de géométrie de détour disponible pour cette modification.")
-
-if not features:
-    st.error("Aucune géométrie à afficher.")
-    st.stop()
-
-# Altair (inline features)
-data_values = json.loads(json.dumps(fc(features)))["features"]
-
-base_layer = alt.Chart(alt.Data(values=[f for f in data_values if f["properties"]["kind"] == "base"])) \
-    .mark_geoshape(fill=None, stroke=base_color, strokeWidth=2) \
-    .encode(tooltip=[alt.Tooltip("properties.shape_id:N", title="shape_id")]) \
-    .project(type="mercator")
-
-detour_layer = alt.Chart(alt.Data(values=[f for f in data_values if f["properties"]["kind"] == "detour"])) \
-    .mark_geoshape(fill=None, stroke=detour_color, strokeDash=[6, 4], strokeWidth=3) \
-    .encode(tooltip=[alt.Tooltip("properties.mod_index:N", title="modification")]) \
-    .project(type="mercator")
-
-chart = (base_layer + detour_layer).properties(title="Trajet (GTFS) vs Détour (TripModifications)",
-                                               width="container", height=520)
-st.altair_chart(chart, use_container_width=True)
-
-# Aperçu brut
-with st.expander("Aperçu (résumé du message)"):
-    st.json({
-        "service_dates": list(tm_msg.service_dates),
-        "selected_trips_count": len(tm_msg.selected_trips),
-        "modifications_count": len(tm_msg.modifications)
-    })
+if __name__ == "__main__":
+    main()
