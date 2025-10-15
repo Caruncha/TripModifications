@@ -8,6 +8,12 @@ from pathlib import Path
 
 import pandas as pd
 import altair as alt
+import pydeck as pdk  # fond de carte
+
+# Montréal (centre par défaut si on ne calcule pas le viewport dynamiquement)
+MTL_CENTER = {"lat": 45.5017, "lon": -73.5673, "zoom": 11}
+# Style de carte (gratuit, sans clé) - tu peux essayer "dark-matter" aussi
+CARTO_BASEMAP = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 # ------------------------------------------------------------------------------
 # 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
@@ -17,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    import gtfs_realtime_pb2 as gtfs_local  # votre fichier local
+    import gtfs_realtime_pb2 as gtfs_local  # votre fichier local (prioritaire)
 except Exception:
     gtfs_local = None  # fallback vers les bindings pip si possible
 
@@ -305,13 +311,12 @@ def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], RtShape
 
 
 # ------------------------------------------------------------------------------
-# 5) Chargement GTFS (zip) + index
+# 5) Chargement GTFS (zip) + index (trips, stop_times, stops, shapes.txt)
 # ------------------------------------------------------------------------------
 @dataclass
-
 class GtfsStatic:
     trips: Dict[str, Dict[str, str]]                      # trip_id -> row trips.txt
-    stop_times: Dict[str, List[Dict[str, str]]]           # trip_id -> [rows stop_times.txt]
+    stop_times: Dict[str, List[Dict[str, str]]]           # trip_id -> rows stop_times.txt
     stops: Dict[str, Dict[str, str]]                      # stop_id -> row stops.txt
     shapes_by_id: Dict[str, List[Tuple[float, float]]]    # shape_id -> [(lat, lon), ...]
 
@@ -488,18 +493,8 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
 
 
 # ------------------------------------------------------------------------------
-# 7) Altair — construction des calques (route, tronçon, marqueurs)
+# 7) Altair — construction des calques (route GTFS shapes.txt, tronçon, marqueurs)
 # ------------------------------------------------------------------------------
-def _shape_poly_for_trip(trip_id: str, gtfs: GtfsStatic) -> Optional[List[Tuple[float, float]]]:
-    """Retourne la polyline (lat, lon) du trip à partir de shapes.txt si possible."""
-    row = gtfs.trips.get(trip_id)
-    if not row:
-        return None
-    shape_id = row.get('shape_id') or ''
-    if not shape_id:
-        return None
-    poly = gtfs.shapes_by_id.get(shape_id)
-    return poly
 def _haversine(lat1, lon1, lat2, lon2):
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -518,12 +513,22 @@ def _nearest_index_on_polyline(poly: List[Tuple[float, float]], lat: float, lon:
             dmin, imin = d, i
     return imin
 
+def _shape_poly_for_trip(trip_id: str, gtfs: GtfsStatic) -> Optional[List[Tuple[float, float]]]:
+    """Retourne la polyline (lat, lon) du trip à partir de shapes.txt si possible."""
+    row = gtfs.trips.get(trip_id)
+    if not row:
+        return None
+    shape_id = row.get('shape_id') or ''
+    if not shape_id:
+        return None
+    return gtfs.shapes_by_id.get(shape_id)
+
 def _build_altair_layers_for_entity(
     ent: TripModEntity,
     rt: RtShapesAndStops,
     gtfs: GtfsStatic
 ) -> Optional[alt.Chart]:
-    # 1) Choisir un trip_id existant dans GTFS pour résoudre selectors + shape
+    # 1) Choisir un trip_id existant pour résoudre selectors + shape
     trip_id_ref = None
     for s in ent.selected_trips:
         for tid in s.trip_ids:
@@ -533,20 +538,16 @@ def _build_altair_layers_for_entity(
     if not trip_id_ref:
         return None
 
-    # 2) Polyline complète depuis shapes.txt (fallback RT si absent)
+    # 2) Polyline complète via shapes.txt (fallback RT shape si absent)
     poly = _shape_poly_for_trip(trip_id_ref, gtfs)
-    if (not poly or len(poly) < 2):
-        # Fallback: tenter shape_id du feed RT (selected_trips.shape_id)
-        shape_id = None
-        for s in ent.selected_trips:
-            if s.shape_id:
-                shape_id = s.shape_id; break
+    if not poly or len(poly) < 2:
+        shape_id = next((s.shape_id for s in ent.selected_trips if s.shape_id), None)
         if shape_id and shape_id in rt.shapes and len(rt.shapes[shape_id]) >= 2:
             poly = rt.shapes[shape_id]
         else:
             return None
 
-    # 3) Résoudre coordinates start/end (par stop_id GTFS -> lat/lon ; fallback RT stops ; fallback stop_sequence)
+    # 3) Résoudre coords start/end (stop_id GTFS/RT ou stop_sequence)
     st_list = gtfs.stop_times.get(trip_id_ref, [])
 
     def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
@@ -568,8 +569,6 @@ def _build_altair_layers_for_entity(
 
     df_segment = None
     df_markers = []
-
-    # on trace la première modification (tu peux itérer si tu veux toutes les afficher)
     if ent.modifications:
         m = ent.modifications[0]
         start_c = _coord_from_selector(m.start_stop_selector)
@@ -637,12 +636,148 @@ def _build_altair_layers_for_entity(
 
 
 # ------------------------------------------------------------------------------
-# 8) UI Streamlit
+# 8) pydeck — carte avec fond Montréal (basemap CARTO), route + tronçon + marqueurs
+# ------------------------------------------------------------------------------
+def _lonlat_path(poly: List[Tuple[float, float]]) -> List[List[float]]:
+    """(lat,lon) -> (lon,lat) pour Deck.gl"""
+    return [[lo, la] for la, lo in poly]
+
+def _bounds_of_paths(paths: List[List[List[float]]]) -> Optional[Tuple[float, float, float, float]]:
+    if not paths:
+        return None
+    lons, lats = [], []
+    for p in paths:
+        for lo, la in p:
+            lons.append(lo); lats.append(la)
+    if not lons or not lats:
+        return None
+    return min(lons), min(lats), max(lons), max(lats)
+
+def _view_state_for_paths(paths: List[List[List[float]]]) -> pdk.ViewState:
+    b = _bounds_of_paths(paths)
+    if not b:
+        return pdk.ViewState(latitude=MTL_CENTER["lat"], longitude=MTL_CENTER["lon"], zoom=MTL_CENTER["zoom"])
+    min_lo, min_la, max_lo, max_la = b
+    ctr_lo = (min_lo + max_lo) / 2
+    ctr_la = (min_la + max_la) / 2
+    span = max(max_lo - min_lo, max_la - min_la)
+    zoom = 14 if span < 0.02 else 12 if span < 0.1 else 10 if span < 0.5 else 9
+    return pdk.ViewState(latitude=ctr_la, longitude=ctr_lo, zoom=zoom)
+
+def _build_pydeck_for_entity(ent: TripModEntity, rt: RtShapesAndStops, gtfs: GtfsStatic) -> Optional[pdk.Deck]:
+    # trip_id existant
+    trip_id_ref = None
+    for s in ent.selected_trips:
+        for tid in s.trip_ids:
+            if tid in gtfs.trips:
+                trip_id_ref = tid; break
+        if trip_id_ref: break
+    if not trip_id_ref:
+        return None
+
+    # itinéraire complet via shapes.txt (fallback RT)
+    poly = _shape_poly_for_trip(trip_id_ref, gtfs)
+    if not poly or len(poly) < 2:
+        shape_id = next((s.shape_id for s in ent.selected_trips if s.shape_id), None)
+        if shape_id and shape_id in rt.shapes and len(rt.shapes[shape_id]) >= 2:
+            poly = rt.shapes[shape_id]
+        else:
+            return None
+
+    # segment impacté & marqueurs
+    segment = []
+    markers = []
+    st_list = gtfs.stop_times.get(trip_id_ref, [])
+
+    def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
+        if sel is None: return None
+        if sel.stop_id:
+            if sel.stop_id in gtfs.stops:
+                r = gtfs.stops[sel.stop_id]
+                try: return (float(r.get('stop_lat')), float(r.get('stop_lon')), sel.stop_id)
+                except: pass
+            if sel.stop_id in rt.rt_stops:
+                la, lo = rt.rt_stops[sel.stop_id]; return (la, lo, sel.stop_id)
+        if sel.stop_sequence is not None:
+            for r in st_list:
+                try:
+                    if int(r.get('stop_sequence') or -999) == sel.stop_sequence:
+                        return (float(r.get('stop_lat')), float(r.get('stop_lon')), r.get('stop_id'))
+                except: pass
+        return None
+
+    if ent.modifications:
+        m = ent.modifications[0]
+        start_c = _coord_from_selector(m.start_stop_selector)
+        end_c   = _coord_from_selector(m.end_stop_selector)
+        if start_c and end_c:
+            s_idx = _nearest_index_on_polyline(poly, start_c[0], start_c[1])
+            e_idx = _nearest_index_on_polyline(poly, end_c[0], end_c[1])
+            if s_idx is not None and e_idx is not None:
+                if e_idx < s_idx:
+                    s_idx, e_idx = e_idx, s_idx
+                s_idx = max(0, s_idx); e_idx = min(len(poly)-1, e_idx)
+                if e_idx > s_idx:
+                    segment = poly[s_idx:e_idx+1]
+            markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
+            markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
+        # arrêts de remplacement
+        order = 1
+        for rs in m.replacement_stops:
+            sid = rs.stop_id
+            la_lo = None
+            if sid in gtfs.stops:
+                r = gtfs.stops[sid]
+                try: la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
+                except: pass
+            if not la_lo and sid in rt.rt_stops:
+                la_lo = rt.rt_stops[sid]
+            if la_lo:
+                markers.append({"type":"repl","lat":la_lo[0], "lon":la_lo[1], "label": f"{order}·{sid}"})
+            order += 1
+
+    # couches Deck.gl
+    route_path = _lonlat_path(poly)
+    seg_path   = _lonlat_path(segment) if segment else None
+
+    layers = [
+        pdk.Layer("PathLayer", data=[{"path": route_path}],
+                  get_path="path", get_color=[154,160,166, 200], width_scale=1, width_min_pixels=2, pickable=False)
+    ]
+    if seg_path and len(seg_path) > 1:
+        layers.append(
+            pdk.Layer("PathLayer", data=[{"path": seg_path}],
+                      get_path="path", get_color=[217,48,37, 255], width_scale=1, width_min_pixels=4, pickable=False)
+        )
+    if markers:
+        layers.append(
+            pdk.Layer("ScatterplotLayer",
+                      data=[{"position":[m["lon"], m["lat"]], "type": m["type"]} for m in markers],
+                      get_position="position",
+                      get_fill_color="[24,128,56] if type == 'start' else ([32,33,36] if type == 'end' else [249,171,0])",
+                      get_radius=25, radius_min_pixels=4, pickable=True)
+        )
+        layers.append(
+            pdk.Layer("TextLayer",
+                      data=[{"position":[m["lon"], m["lat"]], "text": m["label"], "type": m["type"]} for m in markers],
+                      get_position="position", get_text="text",
+                      get_color="[24,128,56] if type == 'start' else ([32,33,36] if type == 'end' else [249,171,0])",
+                      get_size=16, get_alignment_baseline="'top'")
+        )
+
+    paths_for_view = [route_path] + ([seg_path] if seg_path else [])
+    view_state = _view_state_for_paths(paths_for_view)
+
+    return pdk.Deck(layers=layers, initial_view_state=view_state, map_style=CARTO_BASEMAP, tooltip={"text": "{type}"})
+
+
+# ------------------------------------------------------------------------------
+# 9) UI Streamlit
 # ------------------------------------------------------------------------------
 st.set_page_config(page_title="Analyse TripModifications + GTFS", layout="wide")
 
 st.title("Analyse TripModifications (JSON/PB) vs GTFS")
-st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json ou .pb), puis lance l’analyse. Visualisation Altair des détours incluse.")
+st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json ou .pb), puis lance l’analyse (Altair + fond de carte Montréal).")
 
 with st.sidebar:
     st.header("Données d’entrée")
@@ -668,7 +803,7 @@ if run_btn:
 
     st.success(f"GTFS chargé : **{len(gtfs.trips):,} trips**, "
                f"**{sum(len(v) for v in gtfs.stop_times.values()):,} stop_times**, "
-               f"**{len(gtfs.stops):,} stops**")
+               f"**{len(gtfs.stops):,} stops**, **{len(gtfs.shapes_by_id):,} shapes**")
     st.success(f"TripModifications : **{len(ents)} entités**")
 
     if dump_first and ents:
@@ -701,7 +836,7 @@ if run_btn:
     st.subheader("Synthèse par entité")
     st.dataframe(table, use_container_width=True, height=360)
 
-    # Détails par entité (avec Altair)
+    # Détails par entité : tableau + Altair + Carte (pydeck)
     st.subheader("Détails")
     for r in reports[:200]:  # limite d'affichage
         with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
@@ -720,14 +855,21 @@ if run_btn:
             } for t in r.trips]
             st.dataframe(detail_rows, use_container_width=True, height=240)
 
-            # Visualisation Altair (route + tronçon + marqueurs)
+            # Altair (route + tronçon + marqueurs)
             ent = next((e for e in ents if e.entity_id == r.entity_id), None)
             if ent:
                 chart = _build_altair_layers_for_entity(ent, rt, gtfs)
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
                 else:
-                    st.info("Pas de shape exploitable pour visualiser ce détour.")
+                    st.info("Altair: pas de shape exploitable.")
+
+                # Carte pydeck (fond Montréal)
+                deck = _build_pydeck_for_entity(ent, rt, gtfs)
+                if deck is not None:
+                    st.pydeck_chart(deck, use_container_width=True)
+                else:
+                    st.info("Carte: pas de shape exploitable.")
 
     # Export du rapport brut
     report_json = {
@@ -743,4 +885,4 @@ if run_btn:
 
 else:
     st.info("Charge un GTFS (.zip) et un TripModifications (.json/.pb), puis clique **Analyser**.")
-    st.caption("Le parseur suit la structure du feed (selected_trips, service_dates, modifications, etc.).")
+    st.caption("La route complète vient de shapes.txt (GTFS), le tronçon impacté est mis en évidence, et la carte pydeck utilise un fond Montréal.")
