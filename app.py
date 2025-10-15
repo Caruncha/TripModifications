@@ -24,6 +24,7 @@ Références :
 
 from __future__ import annotations
 
+import re
 import io
 import json
 import re
@@ -68,6 +69,70 @@ def read_gtfs_tables(gtfs_zip: bytes) -> Dict[str, pd.DataFrame]:
     shapes = shapes.sort_values(["shape_id", "shape_pt_sequence"])
     return {"trips": trips, "routes": routes, "stops": stops, "shapes": shapes}
 
+_CAMEL_TO_SNAKE_RE_1 = re.compile('(.)([A-Z][a-z]+)')
+_CAMEL_TO_SNAKE_RE_2 = re.compile('([a-z0-9])([A-Z])')
+
+# Mapping explicite pour certains noms "officiels" du proto
+# (afin de gérer proprement serviceDates -> service_dates, etc.)
+JSON_FIELD_MAPPING = {
+    # Top-level TripModifications
+    "selectedTrips": "selected_trips",
+    "startTimes": "start_times",
+    "serviceDates": "service_dates",
+    "modifications": "modifications",
+
+    # SelectedTrips
+    "tripIds": "trip_ids",
+    "routeId": "route_id",
+    "directionId": "direction_id",
+
+    # Modification (détours)
+    "replacementStops": "replacement_stops",
+    "startStopSelector": "start_stop_selector",
+    "endStopSelector": "end_stop_selector",
+
+    # ReplacementStop
+    "stopId": "stop_id",
+    "travelTimeToStop": "travel_time_to_stop",
+
+    # Shape (RT)
+    "encodedPolyline": "encoded_polyline",
+    "shapeId": "shape_id",
+    # Points (si présents)
+    "shapePtLat": "shape_pt_lat",
+    "shapePtLon": "shape_pt_lon",
+
+    # Divers sélecteurs (parfois via EntitySelector équivalents)
+    "stopIdSelector": "stop_id_selector",  # par précaution
+}
+
+
+def camel_to_snake(name: str) -> str:
+    """Convertit lowerCamelCase/PascalCase vers snake_case."""
+    s1 = _CAMEL_TO_SNAKE_RE_1.sub(r'\1_\2', name)
+    return _CAMEL_TO_SNAKE_RE_2.sub(r'\1_\2', s1).lower()
+
+
+def normalize_keys(obj):
+    """
+    Normalise récursivement les clés de dict :
+      1) mapping explicite (JSON_FIELD_MAPPING)
+      2) camelCase -> snake_case
+    Conserve les listes telles quelles (en normalisant leur contenu).
+    """
+    if isinstance(obj, dict):
+        new_d = {}
+        for k, v in obj.items():
+            if k in JSON_FIELD_MAPPING:
+                nk = JSON_FIELD_MAPPING[k]
+            else:
+                nk = camel_to_snake(k)
+            new_d[nk] = normalize_keys(v)
+        return new_d
+    elif isinstance(obj, list):
+        return [normalize_keys(x) for x in obj]
+    else:
+        return obj
 
 def shape_id_for_trip(trips: pd.DataFrame, trip_id: str) -> Optional[str]:
     row = trips.loc[trips["trip_id"] == str(trip_id)]
@@ -139,13 +204,40 @@ def parse_trip_modifications_from_pb(pb_bytes: bytes) -> gtfs_realtime_pb2.TripM
     return msg
 
 
-def parse_trip_modifications_from_json(file_obj) -> Tuple[gtfs_realtime_pb2.TripModifications, Dict[str, Any]]:
-    """Parse JSON -> message TripModifications (via ParseDict)."""
-    tm_dict = json.load(file_obj)
+def parse_trip_modifications_from_json(file_obj):
+    """Parse JSON -> message TripModifications en tolérant camelCase et snake_case."""
+    # 1) Charger le JSON brut
+    try:
+        tm_dict_raw = json.load(file_obj)
+    except Exception as e:
+        st.error(f"Erreur lecture JSON : {e}")
+        st.stop()
+
+    # 2) Normaliser les clés vers snake_case attendu par le proto
+    tm_dict_norm = normalize_keys(tm_dict_raw)
+
+    # 3) Tenter ParseDict sur la version normalisée
     msg = gtfs_realtime_pb2.TripModifications()
-    # Tolérer quelques écarts de clés/casing
-    ParseDict(tm_dict, msg, ignore_unknown_fields=True)
-    return msg, tm_dict
+    try:
+        ParseDict(tm_dict_norm, msg, ignore_unknown_fields=True)
+        return msg, tm_dict_norm
+    except Exception as e_norm:
+        # 4) En fallback, tenter la version brute (si elle était déjà conforme)
+        try:
+            msg2 = gtfs_realtime_pb2.TripModifications()
+            ParseDict(tm_dict_raw, msg2, ignore_unknown_fields=True)
+            return msg2, tm_dict_raw
+        except Exception as e_raw:
+            expected = {"selected_trips", "service_dates", "modifications"}
+            present = set(tm_dict_norm.keys()) if isinstance(tm_dict_norm, dict) else set()
+            st.error(
+                "Le JSON ne correspond pas au schéma TripModifications.\n\n"
+                f"- Erreur (normalisé): {e_norm}\n"
+                f"- Erreur (brut)     : {e_raw}\n\n"
+                f"Clés attendues (indicatif): {sorted(expected)}\n"
+                f"Clés présentes top-level  : {sorted(present) if present else '—'}"
+            )
+            st.stop()
 
 
 def basic_validation(tm: gtfs_realtime_pb2.TripModifications) -> List[str]:
