@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Streamlit - Validation et visualisation d'un fichier TripModifications (GTFS-rt) + GTFS
 # Par M365 Copilot - Exemple
+from __future__ import annotations
 
 import io
 import json
@@ -15,7 +16,7 @@ import altair as alt
 # Bindings officiels GTFS-rt -> inclut TripModifications, Shape, ReplacementStop, etc.
 # cf. proto officiel et ajout de TripModifications (expérimental).
 # Réf : https://gtfs.org/documentation/realtime/proto/ ; https://gtfs.org/documentation/realtime/feed-entities/trip-modifications/
-from google.transit import gtfs_realtime_pb2  # type: ignore
+import gtfs_realtime_pb2
 
 st.set_page_config(page_title="Validation TripModifications (GTFS-rt) + Carte des détours", layout="wide")
 
