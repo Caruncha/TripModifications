@@ -686,23 +686,7 @@ def _build_pydeck_for_entity(ent: TripModEntity, rt: RtShapesAndStops, gtfs: Gtf
 
     # segment impacté & marqueurs
     segment = []
-    markers = []
-    # ... au début de _build_pydeck_for_entity(...) après avoir initialisé markers = []
-def _marker_rgb(t: str):
-    # mapping type -> couleur RGBA
-    return [24,128,56, 255] if t == "start" else ([32,33,36, 255] if t == "end" else [249,171,0, 255])
-
-# Quand tu ajoutes les marqueurs start/end :
-if start_c and end_c:
-    markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1],
-                    "label": start_c[2] or "start", "color": _marker_rgb("start")})
-    markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],
-                    "label": end_c[2] or "end", "color": _marker_rgb("end")})
-
-# Pour chaque arrêt de remplacement :
-if la_lo:
-    markers.append({"type":"repl", "lat": la_lo[0], "lon": la_lo[1],
-                    "label": f"{order}·{sid}", "color": _marker_rgb("repl")})
+    markers: List[Dict[str, Any]] = []
     st_list = gtfs.stop_times.get(trip_id_ref, [])
 
     def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
@@ -722,6 +706,10 @@ if la_lo:
                 except: pass
         return None
 
+    # mapping type -> couleur RGBA (pré-calcul côté Python)
+    def _marker_rgb(t: str):
+        return [24,128,56, 255] if t == "start" else ([32,33,36, 255] if t == "end" else [249,171,0, 255])
+
     if ent.modifications:
         m = ent.modifications[0]
         start_c = _coord_from_selector(m.start_stop_selector)
@@ -735,8 +723,10 @@ if la_lo:
                 s_idx = max(0, s_idx); e_idx = min(len(poly)-1, e_idx)
                 if e_idx > s_idx:
                     segment = poly[s_idx:e_idx+1]
-            markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
-            markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
+            markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1],
+                            "label": start_c[2] or "start", "color": _marker_rgb("start")})
+            markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],
+                            "label": end_c[2] or "end", "color": _marker_rgb("end")})
         # arrêts de remplacement
         order = 1
         for rs in m.replacement_stops:
@@ -749,7 +739,8 @@ if la_lo:
             if not la_lo and sid in rt.rt_stops:
                 la_lo = rt.rt_stops[sid]
             if la_lo:
-                markers.append({"type":"repl","lat":la_lo[0], "lon":la_lo[1], "label": f"{order}·{sid}"})
+                markers.append({"type":"repl","lat":la_lo[0], "lon":la_lo[1],
+                                "label": f"{order}·{sid}", "color": _marker_rgb("repl")})
             order += 1
 
     # couches Deck.gl
@@ -766,18 +757,20 @@ if la_lo:
                       get_path="path", get_color=[217,48,37, 255], width_scale=1, width_min_pixels=4, pickable=False)
         )
     if markers:
+        marker_data = [{"position":[m["lon"], m["lat"]],
+                        "type": m["type"], "label": m["label"], "color": m["color"]} for m in markers]
         layers.append(
             pdk.Layer("ScatterplotLayer",
-                      data=[{"position":[m["lon"], m["lat"]], "type": m["type"]} for m in markers],
+                      data=marker_data,
                       get_position="position",
-                      get_fill_color="[24,128,56] if type == 'start' else ([32,33,36] if type == 'end' else [249,171,0])",
+                      get_fill_color="color",   # <-- champ 'color' pré-calculé
                       get_radius=25, radius_min_pixels=4, pickable=True)
         )
         layers.append(
             pdk.Layer("TextLayer",
-                      data=[{"position":[m["lon"], m["lat"]], "text": m["label"], "type": m["type"]} for m in markers],
-                      get_position="position", get_text="text",
-                      get_color="[24,128,56] if type == 'start' else ([32,33,36] if type == 'end' else [249,171,0])",
+                      data=marker_data,
+                      get_position="position", get_text="label",
+                      get_color="color",        # <-- idem
                       get_size=16, get_alignment_baseline="'top'")
         )
 
@@ -880,7 +873,7 @@ if run_btn:
                 else:
                     st.info("Altair: pas de shape exploitable.")
 
-                # Carte pydeck (fond Montréal)
+                # Carte pydeck (fond Montréal) — couleurs fixées (pas de ternaires strings)
                 deck = _build_pydeck_for_entity(ent, rt, gtfs)
                 if deck is not None:
                     st.pydeck_chart(deck, use_container_width=True)
