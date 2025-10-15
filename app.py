@@ -1,24 +1,26 @@
-# app.py
+# streamlit_app.py
 from __future__ import annotations
-import json, csv, argparse, dataclasses, sys, io, zipfile
+import streamlit as st
+import json, csv, io, zipfile, sys
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple
 from pathlib import Path
 
-################################################################################
-# 0) Import des bindings Protobuf locaux (gtfs_realtime_pb2.py à la racine)
-################################################################################
+# ------------------------------------------------------------------------------
+# 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
+# ------------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))  # priorité au projet
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 try:
     import gtfs_realtime_pb2 as gtfs_local  # votre fichier local
 except Exception:
-    gtfs_local = None  # on tentera les bindings pip si nécessaire
+    gtfs_local = None  # fallback vers les bindings pip si possible
 
-
-################################################################################
-# 1) Modèle normalisé en mémoire
-################################################################################
+# ------------------------------------------------------------------------------
+# 1) Modèle en mémoire normalisé
+# ------------------------------------------------------------------------------
 @dataclass
 class StopSelector:
     stop_sequence: Optional[int] = None
@@ -35,7 +37,6 @@ class Modification:
     end_stop_selector: Optional[StopSelector] = None
     replacement_stops: List[ReplacementStop] = field(default_factory=list)
     propagated_modification_delay: Optional[int] = None
-
 @dataclass
 class SelectedTrips:
     trip_ids: List[str] = field(default_factory=list)
@@ -49,16 +50,11 @@ class TripModEntity:
     start_times: List[str] = field(default_factory=list)
     modifications: List[Modification] = field(default_factory=list)
 
-
-################################################################################
-# 2) Utilitaires: détection JSON/PB, coercions
-################################################################################
-def _detect_tripmods_format(path: Path) -> str:
-    if path.suffix.lower() == '.json':
-        return 'json'
-    if path.suffix.lower() in ('.pb', '.pbf', '.bin'):
-        return 'pb'
-    head = path.read_bytes()[:2].lstrip()
+# ------------------------------------------------------------------------------
+# 2) Utilitaires parsing + normalisation
+# ------------------------------------------------------------------------------
+def _detect_tripmods_format_bytes(b: bytes) -> str:
+    head = (b[:2] or b'').lstrip()
     return 'json' if head.startswith(b'{') or head.startswith(b'[') else 'pb'
 
 def _coerce_selector(obj: Dict[str, Any]) -> StopSelector:
@@ -94,10 +90,9 @@ def _coerce_selected_trips(obj: Dict[str, Any]) -> SelectedTrips:
     shape_id = str(shape_id) if shape_id not in (None, '') else None
     return SelectedTrips(trip_ids=trips, shape_id=shape_id)
 
-
-################################################################################
-# 3) Parsing TripModifications (JSON et Protobuf)
-################################################################################
+# ------------------------------------------------------------------------------
+# 3) Parsing TripModifications JSON / PB
+# ------------------------------------------------------------------------------
 def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
     entities = feed.get('entity') or []
     out: List[TripModEntity] = []
@@ -108,7 +103,7 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
         sel_raw = tm.get('selected_trips') or []
         selected = [_coerce_selected_trips(s) for s in sel_raw]
 
-        # Dates au niveau trip_modifications (sinon normalisation depuis selected_trips)
+        # Dates au niveau trip_modifications, sinon récup depuis selected_trips
         service_dates = tm.get('service_dates') or []
         if not service_dates:
             for s in sel_raw:
@@ -116,7 +111,6 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
                 if dates:
                     service_dates.extend(dates)
         service_dates = [str(d) for d in service_dates]
-
         start_times = [str(t) for t in tm.get('start_times') or []]
 
         mods: List[Modification] = []
@@ -144,21 +138,17 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
         ))
     return out
 
-
 def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
-    """
-    Utilise d'abord le gtfs_realtime_pb2.py local (racine du repo).
-    Si indisponible ou incompatible, tente les bindings pip (google.transit...).
-    """
+    # Priorité au fichier local
     proto = gtfs_local
     if proto is None:
         try:
             from google.transit import gtfs_realtime_pb2 as proto  # fallback pip
         except Exception as ex:
             raise RuntimeError(
-                "Impossible d'importer les bindings Protobuf. "
-                "Placez `gtfs_realtime_pb2.py` à la racine ou installez "
-                "`gtfs-realtime-bindings` compatibles TripModifications."
+                "Bindings Protobuf introuvables. "
+                "Assure-toi d’avoir `gtfs_realtime_pb2.py` à la racine "
+                "ou installe `gtfs-realtime-bindings` compatibles TripModifications."
             ) from ex
 
     feed = proto.FeedMessage()
@@ -183,21 +173,14 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         for m in getattr(tm, 'modifications', []):
             repl = [ReplacementStop(stop_id=rs.stop_id, travel_time_to_stop=int(getattr(rs, 'travel_time_to_stop', 0)))
                     for rs in getattr(m, 'replacement_stops', [])]
-            if hasattr(m, 'start_stop_selector'):
-                start_sel = StopSelector(
-                    stop_sequence=getattr(m.start_stop_selector, 'stop_sequence', None),
-                    stop_id=getattr(m.start_stop_selector, 'stop_id', None),
-                )
-            else:
-                start_sel = StopSelector()
-            if hasattr(m, 'end_stop_selector'):
-                end_sel = StopSelector(
-                    stop_sequence=getattr(m.end_stop_selector, 'stop_sequence', None),
-                    stop_id=getattr(m.end_stop_selector, 'stop_id', None),
-                )
-            else:
-                end_sel = StopSelector()
-
+            start_sel = StopSelector(
+                stop_sequence=getattr(m.start_stop_selector, 'stop_sequence', None) if hasattr(m, 'start_stop_selector') else None,
+                stop_id=getattr(m.start_stop_selector, 'stop_id', None) if hasattr(m, 'start_stop_selector') else None,
+            )
+            end_sel = StopSelector(
+                stop_sequence=getattr(m.end_stop_selector, 'stop_sequence', None) if hasattr(m, 'end_stop_selector') else None,
+                stop_id=getattr(m.end_stop_selector, 'stop_id', None) if hasattr(m, 'end_stop_selector') else None,
+            )
             mods.append(Modification(
                 start_stop_selector=start_sel,
                 end_stop_selector=end_sel,
@@ -214,77 +197,71 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         ))
     return out
 
-
-def load_tripmods(path: Path) -> List[TripModEntity]:
-    fmt = _detect_tripmods_format(path)
+def load_tripmods_bytes(file_bytes: bytes) -> List[TripModEntity]:
+    fmt = _detect_tripmods_format_bytes(file_bytes)
     if fmt == 'json':
-        feed = json.loads(path.read_text(encoding='utf-8'))
+        feed = json.loads(file_bytes.decode('utf-8'))
         return parse_tripmods_json(feed)
     else:
-        data = path.read_bytes()
-        return parse_tripmods_protobuf(data)
+        return parse_tripmods_protobuf(file_bytes)
 
-
-################################################################################
-# 4) Chargement GTFS statique (zip ou dossier) + index utiles
-################################################################################
+# ------------------------------------------------------------------------------
+# 4) Chargement GTFS (zip) + index
+# ------------------------------------------------------------------------------
 @dataclass
 class GtfsStatic:
-    trips: Dict[str, Dict[str, str]]                      # trip_id -> row
-    stop_times: Dict[str, List[Dict[str, str]]]           # trip_id -> [ {stop_sequence:int, stop_id:str, ...}, ... ]
-    stops: Dict[str, Dict[str, str]]                      # stop_id -> row
+    trips: Dict[str, Dict[str, str]]
+    stop_times: Dict[str, List[Dict[str, str]]]
+    stops: Dict[str, Dict[str, str]]
 
-def _read_csv(path_or_bytes: io.BytesIO | Path, fname: str) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    if isinstance(path_or_bytes, Path) and path_or_bytes.is_dir():
-        p = path_or_bytes / fname
-        if not p.exists():
-            return rows
-        with p.open('r', encoding='utf-8-sig', newline='') as f:
-            for row in csv.DictReader(f):
-                rows.append({k: (v or "").strip() for k, v in row.items()})
-        return rows
-
-    # zip
-    if isinstance(path_or_bytes, Path):
-        with zipfile.ZipFile(path_or_bytes, 'r') as zf:
-            if fname not in zf.namelist():
-                return rows
-            with zf.open(fname) as f:
-                text = io.TextIOWrapper(f, encoding='utf-8-sig', newline='')
-                for row in csv.DictReader(text):
-                    rows.append({k: (v or "").strip() for k, v in row.items()})
-        return rows
-
-    # not expected
-    return rows
-
-def load_gtfs(gtfs_path: str | Path) -> GtfsStatic:
-    p = Path(gtfs_path)
-    trips = {r['trip_id']: r for r in _read_csv(p, 'trips.txt') if 'trip_id' in r}
-    # stop_times triés par stop_sequence (int)
-    st_rows = _read_csv(p, 'stop_times.txt')
+@st.cache_data(show_spinner=False)
+def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
+    trips: Dict[str, Dict[str, str]] = {}
     stop_times: Dict[str, List[Dict[str, str]]] = {}
-    for r in st_rows:
-        trip_id = r.get('trip_id')
-        if not trip_id:
-            continue
-        lst = stop_times.setdefault(trip_id, [])
-        # cast safe
-        try:
-            r['stop_sequence'] = str(int(r.get('stop_sequence', '').strip()))
-        except Exception:
-            r['stop_sequence'] = ''
-        lst.append(r)
-    for trip_id, lst in stop_times.items():
-        lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
-    stops = {r['stop_id']: r for r in _read_csv(p, 'stops.txt') if 'stop_id' in r}
+    stops: Dict[str, Dict[str, str]] = {}
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
+        # trips.txt
+        if 'trips.txt' in zf.namelist():
+            with zf.open('trips.txt') as f:
+                for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
+                    row = {k: (v or "").strip() for k, v in row.items()}
+                    if 'trip_id' in row:
+                        trips[row['trip_id']] = row
+
+        # stop_times.txt
+        if 'stop_times.txt' in zf.namelist():
+            with zf.open('stop_times.txt') as f:
+                rows = []
+                for r in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
+                    r = {k: (v or "").strip() for k, v in r.items()}
+                    rows.append(r)
+                for r in rows:
+                    tid = r.get('trip_id') or ''
+                    if not tid:
+                        continue
+                    lst = stop_times.setdefault(tid, [])
+                    try:
+                        r['stop_sequence'] = str(int(r.get('stop_sequence', '').strip()))
+                    except Exception:
+                        r['stop_sequence'] = ''
+                    lst.append(r)
+                for tid, lst in stop_times.items():
+                    lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
+
+        # stops.txt
+        if 'stops.txt' in zf.namelist():
+            with zf.open('stops.txt') as f:
+                for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
+                    row = {k: (v or "").strip() for k, v in row.items()}
+                    if 'stop_id' in row:
+                        stops[row['stop_id']] = row
+
     return GtfsStatic(trips=trips, stop_times=stop_times, stops=stops)
 
-
-################################################################################
-# 5) Analyse TripModifications vs GTFS
-################################################################################
+# ------------------------------------------------------------------------------
+# 5) Analyse TripMods vs GTFS
+# ------------------------------------------------------------------------------
 @dataclass
 class TripCheck:
     trip_id: str
@@ -305,7 +282,6 @@ class EntityReport:
     replacement_stops_unknown_in_gtfs: List[str] = field(default_factory=list)
 
 def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]]) -> Optional[int]:
-    """Résout un stop_selector vers un stop_sequence (priorité au sequence, fallback par stop_id)."""
     if sel is None:
         return None
     if sel.stop_sequence is not None:
@@ -340,7 +316,6 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                     notes.append("trip_id absent du GTFS")
                     totals["missing_trip_ids"] += 1
                 else:
-                    # on évalue sur TOUTES les modifications de l’entité (même si plusieurs)
                     for m in e.modifications:
                         sseq = _seq_from_selector(m.start_stop_selector, st_list) if st_list else None
                         eseq = _seq_from_selector(m.end_stop_selector,   st_list) if st_list else None
@@ -354,11 +329,11 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                         else:
                             start_ok = True
                             end_ok = True
+
                 trip_checks.append(TripCheck(trip_id=trip_id, exists_in_gtfs=exists,
                                              start_seq_valid=start_ok, end_seq_valid=end_ok,
                                              start_seq=start_seq, end_seq=end_seq, notes=notes))
 
-        # replacement_stops (on signale ceux inconnus dans stops.txt; NB: des arrêts temporaires peuvent être normaux)
         for m in e.modifications:
             for rs in m.replacement_stops:
                 sid = rs.stop_id
@@ -380,48 +355,96 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
 
     return reports, totals
 
+# ------------------------------------------------------------------------------
+# 6) UI Streamlit
+# ------------------------------------------------------------------------------
+st.set_page_config(page_title="Analyse TripModifications + GTFS", layout="wide")
 
-################################################################################
-# 6) CLI de l’app
-################################################################################
-def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Analyse GTFS + TripModifications (JSON ou PB)."
+st.title("Analyse TripModifications (JSON/PB) vs GTFS")
+st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json ou .pb), puis lance l’analyse.")
+
+with st.sidebar:
+    st.header("Données d’entrée")
+    gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
+    tripmods_file = st.file_uploader("TripModifications (.json/.pb)", type=["json", "pb", "pbf", "bin"])
+    dump_first = st.checkbox("Afficher le 1er trip_mod normalisé", value=False)
+    run_btn = st.button("Analyser", type="primary")
+
+if run_btn:
+    if not gtfs_file or not tripmods_file:
+        st.error("Merci de sélectionner un GTFS (.zip) **et** un TripModifications (.json/.pb).")
+        st.stop()
+
+    with st.spinner("Chargement du GTFS…"):
+        gtfs = load_gtfs_zip_bytes(gtfs_file.getvalue())
+    with st.spinner("Parsing TripModifications…"):
+        try:
+            ents = load_tripmods_bytes(tripmods_file.getvalue())
+        except Exception as ex:
+            st.exception(ex)
+            st.stop()
+
+    st.success(f"GTFS chargé : **{len(gtfs.trips):,} trips**, "
+               f"**{sum(len(v) for v in gtfs.stop_times.values()):,} stop_times**, "
+               f"**{len(gtfs.stops):,} stops**")
+    st.success(f"TripModifications : **{len(ents)} entités**")
+
+    if dump_first and ents:
+        with st.expander("Aperçu du 1er trip_mod (normalisé)"):
+            st.json(asdict(ents[0]))
+
+    with st.spinner("Analyse en cours…"):
+        reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
+
+    # KPIs
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Entités", totals["total_entities"])
+    c2.metric("trip_ids sélectionnés", totals["total_trip_ids"])
+    c3.metric("modifications", totals["total_modifications"])
+    c4.metric("trip_ids manquants", totals["missing_trip_ids"])
+    c5.metric("selectors non résolus", totals["invalid_selectors"])
+    c6.metric("repl. stops inconnus GTFS", totals["unknown_replacement_stops"])
+
+    # Tableau synthèse par entité
+    table = [{
+        "entity_id": r.entity_id,
+        "trip_ids (sélectionnés)": r.total_selected_trip_ids,
+        "modifications": r.modification_count,
+        "service_dates": ", ".join(r.service_dates),
+        "repl_stops inconnus": ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else ""
+    } for r in reports]
+    st.subheader("Synthèse par entité")
+    st.dataframe(table, use_container_width=True, height=360)
+
+    # Détails par entité (expanders)
+    st.subheader("Détails")
+    for r in reports[:200]:  # limite d'affichage
+        with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
+            st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
+            st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
+                     ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
+            detail_rows = [{
+                "trip_id": t.trip_id,
+                "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
+                "start_seq": t.start_seq if t.start_seq is not None else "",
+                "end_seq": t.end_seq if t.end_seq is not None else "",
+                "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
+                "notes": "; ".join(t.notes) if t.notes else ""
+            } for t in r.trips]
+            st.dataframe(detail_rows, use_container_width=True, height=240)
+
+    # Export du rapport brut
+    report_json = {
+        "totals": totals,
+        "entities": [asdict(r) for r in reports]
+    }
+    st.download_button(
+        "📥 Télécharger le rapport JSON",
+        data=json.dumps(report_json, ensure_ascii=False, indent=2),
+        file_name="rapport_tripmods.json",
+        mime="application/json"
     )
-    ap.add_argument("--gtfs", required=True, help="Chemin GTFS (.zip ou dossier)")
-    ap.add_argument("--tripmods", required=True, help="Chemin TripModifications (.json ou .pb)")
-    ap.add_argument("--report-json", default="", help="Fichier où écrire le rapport JSON (optionnel)")
-    ap.add_argument("--dump-first", action="store_true", help="Afficher le 1er trip_mod normalisé")
-    args = ap.parse_args(argv)
 
-    gtfs = load_gtfs(args.gtfs)
-    ents = load_tripmods(Path(args.tripmods))
-
-    # Résumé console
-    print(f"Chargé: {len(gtfs.trips):,} trips, {sum(len(v) for v in gtfs.stop_times.values()):,} stop_times, {len(gtfs.stops):,} stops")
-    print(f"TripModifications: {len(ents)} entités")
-    if args.dump_first and ents:
-        print("\n--- 1er trip_mod (normalisé) ---")
-        print(json.dumps(asdict(ents[0]), ensure_ascii=False, indent=2))
-
-    reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
-
-    print("\n=== Résumé ===")
-    print(f"- Entités: {totals['total_entities']}")
-    print(f"- trip_ids sélectionnés: {totals['total_trip_ids']}")
-    print(f"- modifications: {totals['total_modifications']}")
-    print(f"- trip_ids manquants: {totals['missing_trip_ids']}")
-    print(f"- selectors non résolus: {totals['invalid_selectors']}")
-    print(f"- replacement_stops inconnus dans GTFS: {totals['unknown_replacement_stops']} (peuvent être des arrêts temporaires)")
-
-    if args.report_json:
-        out = {
-            "totals": totals,
-            "entities": [asdict(r) for r in reports]
-        }
-        Path(args.report_json).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\nRapport écrit: {args.report_json}")
-
-
-if __name__ == "__main__":
-    main()
+else:
+    st.info("Charge un GTFS (.zip) et un TripModifications (.json/.pb), puis clique **Analyser**.")
+    st.caption("Le parseur suit la structure du fichier exo CITLA.json que tu as partagé (selected_trips, service_dates, modifications, etc.).")
