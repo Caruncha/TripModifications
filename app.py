@@ -687,6 +687,22 @@ def _build_pydeck_for_entity(ent: TripModEntity, rt: RtShapesAndStops, gtfs: Gtf
     # segment impacté & marqueurs
     segment = []
     markers = []
+    # ... au début de _build_pydeck_for_entity(...) après avoir initialisé markers = []
+def _marker_rgb(t: str):
+    # mapping type -> couleur RGBA
+    return [24,128,56, 255] if t == "start" else ([32,33,36, 255] if t == "end" else [249,171,0, 255])
+
+# Quand tu ajoutes les marqueurs start/end :
+if start_c and end_c:
+    markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1],
+                    "label": start_c[2] or "start", "color": _marker_rgb("start")})
+    markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],
+                    "label": end_c[2] or "end", "color": _marker_rgb("end")})
+
+# Pour chaque arrêt de remplacement :
+if la_lo:
+    markers.append({"type":"repl", "lat": la_lo[0], "lon": la_lo[1],
+                    "label": f"{order}·{sid}", "color": _marker_rgb("repl")})
     st_list = gtfs.stop_times.get(trip_id_ref, [])
 
     def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
