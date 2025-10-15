@@ -2,3 +2,4 @@ streamlit>=1.32
 altair>=5.1
 pandas>=2.1
 protobuf>=4.25
+pydeck>=0.9
