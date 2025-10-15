@@ -211,7 +211,10 @@ st.title("Validation d’un fichier TripModifications (GTFS‑realtime) + visual
 with st.sidebar:
     st.header("Importer les fichiers")
     gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
-    pb_file   = st.file_uploader("TripModifications (.pb)", type=["pb", "bin", "pbf", "dat"])
+    pb_file = st.file_uploader(
+    "TripModifications (.pb ou .proto)",
+    type=["pb", "bin", "pbf", "dat", "proto"]
+)
 
     st.markdown("---")
     base_color   = st.color_picker("Couleur du trajet de base", "#888888")
