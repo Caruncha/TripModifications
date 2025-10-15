@@ -308,16 +308,19 @@ def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], RtShape
 # 5) Chargement GTFS (zip) + index
 # ------------------------------------------------------------------------------
 @dataclass
+
 class GtfsStatic:
-    trips: Dict[str, Dict[str, str]]
-    stop_times: Dict[str, List[Dict[str, str]]]
-    stops: Dict[str, Dict[str, str]]
+    trips: Dict[str, Dict[str, str]]                      # trip_id -> row trips.txt
+    stop_times: Dict[str, List[Dict[str, str]]]           # trip_id -> [rows stop_times.txt]
+    stops: Dict[str, Dict[str, str]]                      # stop_id -> row stops.txt
+    shapes_by_id: Dict[str, List[Tuple[float, float]]]    # shape_id -> [(lat, lon), ...]
 
 @st.cache_data(show_spinner=False)
 def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
     trips: Dict[str, Dict[str, str]] = {}
     stop_times: Dict[str, List[Dict[str, str]]] = {}
     stops: Dict[str, Dict[str, str]] = {}
+    shapes_by_id: Dict[str, List[Tuple[float, float]]] = {}
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
         # trips.txt
@@ -356,7 +359,35 @@ def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
                     if 'stop_id' in row:
                         stops[row['stop_id']] = row
 
-    return GtfsStatic(trips=trips, stop_times=stop_times, stops=stops)
+        # shapes.txt
+        if 'shapes.txt' in zf.namelist():
+            with zf.open('shapes.txt') as f:
+                shapes_rows = []
+                for r in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
+                    r = {k: (v or "").strip() for k, v in r.items()}
+                    if 'shape_id' in r and 'shape_pt_lat' in r and 'shape_pt_lon' in r:
+                        # sequence -> int
+                        try:
+                            r['shape_pt_sequence'] = int(r.get('shape_pt_sequence', '0').strip())
+                        except Exception:
+                            r['shape_pt_sequence'] = 0
+                        shapes_rows.append(r)
+                # group by shape_id
+                from collections import defaultdict
+                tmp: Dict[str, List[Tuple[int, float, float]]] = defaultdict(list)
+                for r in shapes_rows:
+                    try:
+                        la = float(r['shape_pt_lat'])
+                        lo = float(r['shape_pt_lon'])
+                        tmp[r['shape_id']].append((r['shape_pt_sequence'], la, lo))
+                    except Exception:
+                        continue
+                # sort and project to [(lat, lon)]
+                for sid, lst in tmp.items():
+                    lst.sort(key=lambda x: x[0])
+                    shapes_by_id[sid] = [(la, lo) for _, la, lo in lst]
+
+    return GtfsStatic(trips=trips, stop_times=stop_times, stops=stops, shapes_by_id=shapes_by_id)
 
 
 # ------------------------------------------------------------------------------
@@ -459,6 +490,16 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
 # ------------------------------------------------------------------------------
 # 7) Altair — construction des calques (route, tronçon, marqueurs)
 # ------------------------------------------------------------------------------
+def _shape_poly_for_trip(trip_id: str, gtfs: GtfsStatic) -> Optional[List[Tuple[float, float]]]:
+    """Retourne la polyline (lat, lon) du trip à partir de shapes.txt si possible."""
+    row = gtfs.trips.get(trip_id)
+    if not row:
+        return None
+    shape_id = row.get('shape_id') or ''
+    if not shape_id:
+        return None
+    poly = gtfs.shapes_by_id.get(shape_id)
+    return poly
 def _haversine(lat1, lon1, lat2, lon2):
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -482,87 +523,89 @@ def _build_altair_layers_for_entity(
     rt: RtShapesAndStops,
     gtfs: GtfsStatic
 ) -> Optional[alt.Chart]:
-    # 1) shape_id : on prend le premier groupe selected_trips qui le fournit
-    shape_id = None
-    for s in ent.selected_trips:
-        if s.shape_id:
-            shape_id = s.shape_id
-            break
-    if not shape_id or shape_id not in rt.shapes:
-        return None
-
-    poly = rt.shapes[shape_id]  # [(lat, lon), ...]
-    if len(poly) < 2:
-        return None
-
-    # DataFrame complet de la polyline
-    df_route = pd.DataFrame([{"lat": la, "lon": lo, "seg": "route"} for la, lo in poly])
-
-    # 2) Choisir un trip_id existant dans le GTFS pour résoudre les selectors
+    # 1) Choisir un trip_id existant dans GTFS pour résoudre selectors + shape
     trip_id_ref = None
     for s in ent.selected_trips:
         for tid in s.trip_ids:
             if tid in gtfs.trips:
                 trip_id_ref = tid; break
         if trip_id_ref: break
+    if not trip_id_ref:
+        return None
+
+    # 2) Polyline complète depuis shapes.txt (fallback RT si absent)
+    poly = _shape_poly_for_trip(trip_id_ref, gtfs)
+    if (not poly or len(poly) < 2):
+        # Fallback: tenter shape_id du feed RT (selected_trips.shape_id)
+        shape_id = None
+        for s in ent.selected_trips:
+            if s.shape_id:
+                shape_id = s.shape_id; break
+        if shape_id and shape_id in rt.shapes and len(rt.shapes[shape_id]) >= 2:
+            poly = rt.shapes[shape_id]
+        else:
+            return None
+
+    # 3) Résoudre coordinates start/end (par stop_id GTFS -> lat/lon ; fallback RT stops ; fallback stop_sequence)
+    st_list = gtfs.stop_times.get(trip_id_ref, [])
+
+    def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
+        if sel is None: return None
+        if sel.stop_id:
+            if sel.stop_id in gtfs.stops:
+                r = gtfs.stops[sel.stop_id]
+                try: return (float(r.get('stop_lat')), float(r.get('stop_lon')), sel.stop_id)
+                except: pass
+            if sel.stop_id in rt.rt_stops:
+                la, lo = rt.rt_stops[sel.stop_id]; return (la, lo, sel.stop_id)
+        if sel.stop_sequence is not None:
+            for r in st_list:
+                try:
+                    if int(r.get('stop_sequence') or -999) == sel.stop_sequence:
+                        return (float(r.get('stop_lat')), float(r.get('stop_lon')), r.get('stop_id'))
+                except: pass
+        return None
 
     df_segment = None
     df_markers = []
 
-    if trip_id_ref:
-        st_list = gtfs.stop_times.get(trip_id_ref, [])
+    # on trace la première modification (tu peux itérer si tu veux toutes les afficher)
+    if ent.modifications:
+        m = ent.modifications[0]
+        start_c = _coord_from_selector(m.start_stop_selector)
+        end_c   = _coord_from_selector(m.end_stop_selector)
 
-        if ent.modifications:
-            m = ent.modifications[0]  # si plusieurs, on peut itérer/ajouter un selecteur
-
-            def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
-                if sel is None: return None
-                # priorité stop_id -> coordonnées GTFS (ou RT si temporaire)
-                if sel.stop_id:
-                    if sel.stop_id in gtfs.stops:
-                        r = gtfs.stops[sel.stop_id]
-                        try: return (float(r.get('stop_lat')), float(r.get('stop_lon')), sel.stop_id)
-                        except: pass
-                    if sel.stop_id in rt.rt_stops:
-                        la, lo = rt.rt_stops[sel.stop_id]; return (la, lo, sel.stop_id)
-                # fallback sur stop_sequence
-                if sel.stop_sequence is not None:
-                    for r in st_list:
-                        try:
-                            if int(r.get('stop_sequence') or -999) == sel.stop_sequence:
-                                return (float(r.get('stop_lat')), float(r.get('stop_lon')), r.get('stop_id'))
-                        except: pass
-                return None
-
-            start_c = _coord_from_selector(m.start_stop_selector)
-            end_c   = _coord_from_selector(m.end_stop_selector)
-
-            if start_c and end_c:
-                s_idx = _nearest_index_on_polyline(poly, start_c[0], start_c[1])
-                e_idx = _nearest_index_on_polyline(poly, end_c[0], end_c[1])
-                if s_idx is not None and e_idx is not None and e_idx > s_idx:
+        if start_c and end_c:
+            s_idx = _nearest_index_on_polyline(poly, start_c[0], start_c[1])
+            e_idx = _nearest_index_on_polyline(poly, end_c[0], end_c[1])
+            if s_idx is not None and e_idx is not None:
+                if e_idx < s_idx:
+                    s_idx, e_idx = e_idx, s_idx
+                s_idx = max(0, s_idx); e_idx = min(len(poly)-1, e_idx)
+                if e_idx > s_idx:
                     sub = poly[s_idx:e_idx+1]
                     df_segment = pd.DataFrame([{"lat": la, "lon": lo, "seg": "troncon"} for la, lo in sub])
-                # marqueurs start/end
-                df_markers.append({"type":"start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
-                df_markers.append({"type":"end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
+            # marqueurs start/end
+            df_markers.append({"type":"start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
+            df_markers.append({"type":"end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
 
-            # 3) Arrêts de remplacement
-            order = 1
-            for rs in m.replacement_stops:
-                sid = rs.stop_id
-                la_lo = None
-                if sid in gtfs.stops:
-                    r = gtfs.stops[sid]
-                    try: la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
-                    except: pass
-                if not la_lo and sid in rt.rt_stops:
-                    la_lo = rt.rt_stops[sid]
-                if la_lo:
-                    df_markers.append({"type":"repl", "lat": la_lo[0], "lon": la_lo[1], "label": f"{order}·{sid}"})
-                order += 1
+        # Arrêts de remplacement
+        order = 1
+        for rs in m.replacement_stops:
+            sid = rs.stop_id
+            la_lo = None
+            if sid in gtfs.stops:
+                r = gtfs.stops[sid]
+                try: la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
+                except: pass
+            if not la_lo and sid in rt.rt_stops:
+                la_lo = rt.rt_stops[sid]
+            if la_lo:
+                df_markers.append({"type":"repl", "lat": la_lo[0], "lon": la_lo[1], "label": f"{order}·{sid}"})
+            order += 1
 
-    # DataFrames -> Altair
+    # 4) DataFrames -> Altair
+    df_route = pd.DataFrame([{"lat": la, "lon": lo, "seg": "route"} for la, lo in poly])
     base = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
         x=alt.X("lon:Q", title="Longitude"),
         y=alt.Y("lat:Q", title="Latitude")
@@ -590,8 +633,7 @@ def _build_altair_layers_for_entity(
             )
         )
 
-    chart = alt.layer(*layers).properties(width="container", height=380).interactive()
-    return chart
+    return alt.layer(*layers).properties(width="container", height=380).interactive()
 
 
 # ------------------------------------------------------------------------------
