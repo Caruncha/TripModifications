@@ -17,8 +17,10 @@ import json, csv, io, zipfile, sys, math
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple
 from pathlib import Path
+from vega_datasets import data
 import pandas as pd
 import altair as alt
+
 
 # ----------------------------------------------------------------------------- 
 # 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
@@ -456,8 +458,6 @@ def _nearest_index_on_polyline(poly: List[Tuple[float, float]], lat: float, lon:
         if d < dmin:
             dmin, imin = d, i
     return imin
-
-from vega_datasets import data  # ⬅️ à ajouter en haut du fichier
 
 def _build_altair_layers_for_entity(
     ent: TripModEntity,
