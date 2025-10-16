@@ -1,14 +1,18 @@
-# app.py — Analyse TripModifications (JSON/PB) vs GTFS + visualisation
+# app.py — Analyse TripModifications (JSON/PB) vs GTFS + visualisation Altair
 # -----------------------------------------------------------------------------
-# Changements principaux :
-# - Échelle Altair contrôlée pour éviter l’axe Y forcé à 0 (latitude « écrasée »).
-#   * Calcul du domaine [min, max] sur lon/lat (polyline + marqueurs), avec padding.
-#   * scale=alt.Scale(zero=False, nice=False, domain=[...]) appliquée à TOUTES les couches.
-# - Option UI "Ajuster l’échelle des axes (sans zéro)" activée par défaut.
+# Nouveautés :
+# - Fond cartographique vectoriel (mark_geoshape) avec projection 'mercator'.
+# - Zoom automatique par détour via projection.fit sur le BBOX du tracé (segment
+#   start/end si disponible, sinon shape complète). => Cadrage Montréal & alentours.
+# - Option UI pour activer/désactiver le fond carto (activé par défaut).
+# - Mode "sans basemap" conservé : axes x/y numériques avec domain contrôlé
+#   (zero=False) pour éviter l’écrasement vertical des latitudes.
 #
 # Références :
-# - Vega-Lite Scale: zero/domain/nice — https://vega.github.io/vega-lite/docs/scale.html
-# - Altair: fixer explicitement un domaine via alt.Scale(domain=[...]) — https://stackoverflow.com/a/62281356
+# - Vega-Lite Projection (type, fit, center, etc.) :
+#   https://vega.github.io/vega-lite/docs/projection.html
+# - Geoshape (fond carto TopoJSON/GeoJSON) :
+#   https://vega.github.io/vega-lite/docs/geoshape.html
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -17,12 +21,16 @@ import json, csv, io, zipfile, sys, math
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple
 from pathlib import Path
-from vega_datasets import data
 import pandas as pd
 import altair as alt
 
+# Fond carto (Natural Earth) via vega_datasets
+try:
+    from vega_datasets import data as vega_data
+except Exception:
+    vega_data = None  # on gérera un message si manquant
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
 # -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
@@ -33,7 +41,7 @@ try:
 except Exception:
     gtfs_local = None  # fallback vers les bindings pip si possible
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 1) Modèle en mémoire normalisé
 # -----------------------------------------------------------------------------
 @dataclass
@@ -66,7 +74,7 @@ class TripModEntity:
     start_times: List[str] = field(default_factory=list)
     modifications: List[Modification] = field(default_factory=list)
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 2) Utilitaires parsing + normalisation
 # -----------------------------------------------------------------------------
 def _detect_tripmods_format_bytes(b: bytes) -> str:
@@ -106,7 +114,7 @@ def _coerce_selected_trips(obj: Dict[str, Any]) -> SelectedTrips:
     shape_id = str(shape_id) if shape_id not in (None, '') else None
     return SelectedTrips(trip_ids=trips, shape_id=shape_id)
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 3) Parsing TripModifications JSON / PB
 # -----------------------------------------------------------------------------
 def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
@@ -118,7 +126,6 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
             continue
         sel_raw = tm.get('selected_trips') or []
         selected = [_coerce_selected_trips(s) for s in sel_raw]
-        # Dates au niveau trip_modifications, sinon récup depuis selected_trips
         service_dates = tm.get('service_dates') or []
         if not service_dates:
             for s in sel_raw:
@@ -152,11 +159,10 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
     return out
 
 def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
-    # Priorité au fichier local
     proto = gtfs_local
     if proto is None:
         try:
-            from google.transit import gtfs_realtime_pb2 as proto  # fallback pip
+            from google.transit import gtfs_realtime_pb2 as proto
         except Exception as ex:
             raise RuntimeError(
                 "Bindings Protobuf introuvables. "
@@ -205,7 +211,7 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         ))
     return out
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 4) Shapes & stops RT (depuis le feed TripMods) + décodage polyline
 # -----------------------------------------------------------------------------
 @dataclass
@@ -299,7 +305,7 @@ def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], RtShape
         rt = _collect_shapes_stops_pb(file_bytes)
         return ents, rt, None
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 5) Chargement GTFS (zip) + index
 # -----------------------------------------------------------------------------
 @dataclass
@@ -314,14 +320,12 @@ def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
     stop_times: Dict[str, List[Dict[str, str]]] = {}
     stops: Dict[str, Dict[str, str]] = {}
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-        # trips.txt
         if 'trips.txt' in zf.namelist():
             with zf.open('trips.txt') as f:
                 for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
                     row = {k: (v or "").strip() for k, v in row.items()}
                     if 'trip_id' in row:
                         trips[row['trip_id']] = row
-        # stop_times.txt
         if 'stop_times.txt' in zf.namelist():
             with zf.open('stop_times.txt') as f:
                 rows = []
@@ -340,7 +344,6 @@ def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
                 lst.append(r)
             for tid, lst in stop_times.items():
                 lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
-        # stops.txt
         if 'stops.txt' in zf.namelist():
             with zf.open('stops.txt') as f:
                 for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
@@ -349,7 +352,7 @@ def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
                         stops[row['stop_id']] = row
     return GtfsStatic(trips=trips, stop_times=stop_times, stops=stops)
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 6) Analyse TripMods vs GTFS
 # -----------------------------------------------------------------------------
 @dataclass
@@ -438,8 +441,8 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
         ))
     return reports, totals
 
-# ----------------------------------------------------------------------------- 
-# 7) Altair — construction des calques (route, tronçon, marqueurs) + SCALES FIX
+# -----------------------------------------------------------------------------
+# 7) Altair — calques (route, tronçon, marqueurs) + basemap geoshape + FIT
 # -----------------------------------------------------------------------------
 def _haversine(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -464,7 +467,7 @@ def _build_altair_layers_for_entity(
     rt: RtShapesAndStops,
     gtfs: GtfsStatic,
     fix_scales: bool = True,
-    use_basemap: bool = True,  # ⬅️ nouveau
+    use_basemap: bool = True,  # basemap geoshape + FIT par défaut
 ) -> Optional[alt.Chart]:
     # 1) shape_id
     shape_id = None
@@ -568,19 +571,23 @@ def _build_altair_layers_for_entity(
     # 5) Construction des calques
     layers = []
 
-if use_basemap:
-        # --- Fond carto vectoriel (Natural Earth) ---------------------------
-        world = alt.topo_feature(data.world_110m.url, 'countries')
+    if use_basemap:
+        # --- Fond carto vectoriel (geoshape) --------------------------------
+        if vega_data is None:
+            # Sécurité si vega_datasets n'est pas installé
+            st.warning("Le fond carto nécessite 'vega_datasets'. Ajoute-le au requirements.")
+            return None
+        world = alt.topo_feature(vega_data.world_110m.url, 'countries')
         bg = alt.Chart(world).mark_geoshape(
             fill="#f5f5f5", stroke="#d9d9d9"
         )
+        layers.append(bg)
 
-        # --- Lignes / Tronçon / Marqueurs encodés en canaux géographiques ---
+        # --- Route / tronçon / marqueurs en coordonnées géographiques -------
         route_geo = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
             longitude='lon:Q', latitude='lat:Q'
         )
-
-        layers = [bg, route_geo]
+        layers.append(route_geo)
 
         if df_segment is not None and not df_segment.empty:
             seg_geo = alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
@@ -601,9 +608,7 @@ if use_basemap:
             )
             layers += [pts, labels]
 
-        # --- NOUVEAU : projection FIT sur le BBOX du détour -----------------
-        # On utilise le domaine déjà calculé (lon_min/max, lat_min/max), avec padding,
-        # pour construire un polygone GeoJSON de cadrage.
+        # --- Zoom automatique : projection.fit sur le BBOX du détour --------
         fit_feature = {
             "type": "Feature",
             "geometry": {
@@ -621,12 +626,13 @@ if use_basemap:
 
         chart = (
             alt.layer(*layers)
-               .project(type='mercator', fit=fit_feature)  # <-- ajuste centre + échelle automatiquement
+               .project(type='mercator', fit=fit_feature)  # calcule translate + scale automatiquement
                .properties(width="container", height=380)
                .interactive()
         )
+
     else:
-        # --- Mode sans basemap : axes numériques + cadrage contrôlé ----------
+        # --- Mode sans basemap : axes numériques + cadrage contrôlé ---------
         x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False) if fix_scales else alt.Scale()
         y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False) if fix_scales else alt.Scale()
 
@@ -667,20 +673,22 @@ if use_basemap:
 
     return chart
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # 8) UI Streamlit
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Analyse TripModifications + GTFS", layout="wide")
 st.title("Analyse TripModifications (JSON/PB) vs GTFS")
-st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json ou .pb), puis lance l’analyse. Visualisation Altair des détours incluse.")
+st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json/.pb), puis lance l’analyse. Visualisation Altair des détours incluse.")
 
 with st.sidebar:
     st.header("Données d’entrée")
     gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
     tripmods_file = st.file_uploader("TripModifications (.json/.pb)", type=["json", "pb", "pbf", "bin"])
     dump_first = st.checkbox("Afficher le 1er trip_mod normalisé", value=False)
+    # En mode sans basemap, ces options contrôlent les axes numériques
     fix_scales = st.checkbox("Ajuster l’échelle des axes (sans zéro)", value=True)
-    use_basemap = st.checkbox("Afficher le fond carto (geoshape)", value=True)  # ⬅️ nouveau
+    # Fond carto geoshape + zoom auto via FIT
+    use_basemap = st.checkbox("Afficher le fond carto (geoshape) + zoom automatique", value=True)
     run_btn = st.button("Analyser", type="primary")
 
 if run_btn:
@@ -750,10 +758,12 @@ if run_btn:
             } for t in r.trips]
             st.dataframe(detail_rows, use_container_width=True, height=240)
 
-            # Visualisation Altair (route + tronçon + marqueurs) avec scales contrôlées
+            # Visualisation Altair (route + tronçon + marqueurs)
             ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
             if ent_obj:
-                chart = _build_altair_layers_for_entity(ent_obj, rt, gtfs, fix_scales=fix_scales, use_basemap=use_basemap)
+                chart = _build_altair_layers_for_entity(ent_obj, rt, gtfs,
+                                                        fix_scales=fix_scales,
+                                                        use_basemap=use_basemap)
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
                 else:
