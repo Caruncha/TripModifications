@@ -461,7 +461,7 @@ def _build_altair_layers_for_entity(
     ent: TripModEntity,
     rt: RtShapesAndStops,
     gtfs: GtfsStatic,
-    fix_scales: bool = True,  # nouveau paramètre pour activer/désactiver le correctif
+    fix_scales: bool = True,
 ) -> Optional[alt.Chart]:
     # 1) shape_id : on prend le premier groupe selected_trips qui le fournit
     shape_id = None
@@ -486,6 +486,8 @@ def _build_altair_layers_for_entity(
 
     df_segment = None
     df_markers = []
+    segment_coords: Optional[List[Tuple[float, float]]] = None  # ★ garder les coords du tronçon
+
     if trip_id_ref:
         st_list = gtfs.stop_times.get(trip_id_ref, [])
         if ent.modifications:
@@ -497,10 +499,8 @@ def _build_altair_layers_for_entity(
                 if sel.stop_id:
                     if sel.stop_id in gtfs.stops:
                         r = gtfs.stops[sel.stop_id]
-                        try:
-                            return (float(r.get('stop_lat')), float(r.get('stop_lon')), sel.stop_id)
-                        except Exception:
-                            pass
+                        try: return (float(r.get('stop_lat')), float(r.get('stop_lon')), sel.stop_id)
+                        except Exception: pass
                     if sel.stop_id in rt.rt_stops:
                         la, lo = rt.rt_stops[sel.stop_id]; return (la, lo, sel.stop_id)
                 # fallback sur stop_sequence
@@ -514,38 +514,39 @@ def _build_altair_layers_for_entity(
                 return None
 
             start_c = _coord_from_selector(m.start_stop_selector)
-            end_c = _coord_from_selector(m.end_stop_selector)
+            end_c   = _coord_from_selector(m.end_stop_selector)
 
             if start_c and end_c:
                 s_idx = _nearest_index_on_polyline(poly, start_c[0], start_c[1])
                 e_idx = _nearest_index_on_polyline(poly, end_c[0], end_c[1])
                 if s_idx is not None and e_idx is not None and e_idx > s_idx:
                     sub = poly[s_idx:e_idx+1]
+                    segment_coords = sub                                   # ★ mémoriser le tracé du détour
                     df_segment = pd.DataFrame([{"lat": la, "lon": lo, "seg": "troncon"} for la, lo in sub])
 
-                # marqueurs start/end
+                # marqueurs start/end (n’affectent plus le cadrage) ★
                 df_markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
                 df_markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
 
-            # 3) Arrêts de remplacement
+            # Arrêts de remplacement (n’affectent plus le cadrage) ★
             order = 1
             for rs in m.replacement_stops:
                 sid = rs.stop_id
                 la_lo = None
                 if sid in gtfs.stops:
                     r = gtfs.stops[sid]
-                    try:
-                        la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
-                    except Exception:
-                        pass
+                    try: la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
+                    except Exception: pass
                 if not la_lo and sid in rt.rt_stops:
                     la_lo = rt.rt_stops[sid]
                 if la_lo:
                     df_markers.append({"type": "repl", "lat": la_lo[0], "lon": la_lo[1], "label": f"{order}·{sid}"})
                     order += 1
 
-    # 4) Domaine X/Y contrôlé (lon/lat) — inclut poly + marqueurs; padding + zero=False
-    def _compute_domain(coords: List[Tuple[float, float]]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    # 3) Domaine X/Y basé STRICTEMENT sur le tracé GTFS du détour ★
+    #    -> si segment résolu : domaine = segment ; sinon = shape complète.
+    def _compute_domain_from_coords(coords: List[Tuple[float, float]],
+                                    frac: float = 0.03, floor: float = 1e-4) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         if not coords:
             return (-180.0, 180.0), (-90.0, 90.0)
         lats = [la for la, _ in coords]
@@ -553,30 +554,25 @@ def _build_altair_layers_for_entity(
         lat_min, lat_max = min(lats), max(lats)
         lon_min, lon_max = min(lons), max(lons)
 
-        def _pad(minv, maxv, frac=0.02, floor=1e-4):
-            span = max(maxv - minv, floor)
-            pad = max(span * frac, floor)
-            return (minv - pad, maxv + pad)
+        # padding léger pour respirer, mais on reste centré sur le tracé (pas les marqueurs)
+        span_lat = max(lat_max - lat_min, floor)
+        span_lon = max(lon_max - lon_min, floor)
+        pad_lat = max(span_lat * frac, floor)
+        pad_lon = max(span_lon * frac, floor)
 
-        lon_min, lon_max = _pad(lon_min, lon_max)
-        lat_min, lat_max = _pad(lat_min, lat_max)
-        return (lon_min, lon_max), (lat_min, lat_max)
+        return (lon_min - pad_lon, lon_max + pad_lon), (lat_min - pad_lat, lat_max + pad_lat)
 
-    coords_for_domain = list(poly)
-    if df_markers:
-        for mk in df_markers:
-            coords_for_domain.append((mk["lat"], mk["lon"]))
-
-    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain(coords_for_domain)
+    coords_for_domain = segment_coords if segment_coords else poly  # ★ choix de base du cadrage
+    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain_from_coords(coords_for_domain)
 
     if fix_scales:
         x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
         y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
     else:
-        x_scale = alt.Scale()  # auto
-        y_scale = alt.Scale()  # auto
+        x_scale = alt.Scale()
+        y_scale = alt.Scale()
 
-    # 5) DataFrames -> Altair (avec scales appliquées partout)
+    # 4) DataFrames -> Altair (scales appliquées partout)
     df_route = pd.DataFrame([{"lat": la, "lon": lo, "seg": "route"} for la, lo in poly])
 
     base = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
