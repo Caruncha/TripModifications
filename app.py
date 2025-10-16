@@ -457,13 +457,16 @@ def _nearest_index_on_polyline(poly: List[Tuple[float, float]], lat: float, lon:
             dmin, imin = d, i
     return imin
 
+from vega_datasets import data  # ⬅️ à ajouter en haut du fichier
+
 def _build_altair_layers_for_entity(
     ent: TripModEntity,
     rt: RtShapesAndStops,
     gtfs: GtfsStatic,
     fix_scales: bool = True,
+    use_basemap: bool = True,  # ⬅️ nouveau
 ) -> Optional[alt.Chart]:
-    # 1) shape_id : on prend le premier groupe selected_trips qui le fournit
+    # 1) shape_id
     shape_id = None
     for s in ent.selected_trips:
         if s.shape_id:
@@ -476,7 +479,7 @@ def _build_altair_layers_for_entity(
     if len(poly) < 2:
         return None
 
-    # 2) Choisir un trip_id existant dans le GTFS pour résoudre les selectors
+    # 2) tenter de résoudre un tronçon start/end sur un trip GTFS existant
     trip_id_ref = None
     for s in ent.selected_trips:
         for tid in s.trip_ids:
@@ -486,16 +489,15 @@ def _build_altair_layers_for_entity(
 
     df_segment = None
     df_markers = []
-    segment_coords: Optional[List[Tuple[float, float]]] = None  # ★ garder les coords du tronçon
+    segment_coords: Optional[List[Tuple[float, float]]] = None
 
     if trip_id_ref:
         st_list = gtfs.stop_times.get(trip_id_ref, [])
         if ent.modifications:
-            m = ent.modifications[0]  # si plusieurs, on peut itérer/ajouter un sélecteur
+            m = ent.modifications[0]
 
             def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
                 if sel is None: return None
-                # priorité stop_id -> coordonnées GTFS (ou RT si temporaire)
                 if sel.stop_id:
                     if sel.stop_id in gtfs.stops:
                         r = gtfs.stops[sel.stop_id]
@@ -503,7 +505,6 @@ def _build_altair_layers_for_entity(
                         except Exception: pass
                     if sel.stop_id in rt.rt_stops:
                         la, lo = rt.rt_stops[sel.stop_id]; return (la, lo, sel.stop_id)
-                # fallback sur stop_sequence
                 if sel.stop_sequence is not None:
                     for r in st_list:
                         try:
@@ -516,19 +517,20 @@ def _build_altair_layers_for_entity(
             start_c = _coord_from_selector(m.start_stop_selector)
             end_c   = _coord_from_selector(m.end_stop_selector)
 
+            # sous-tracé (segment) entre start/end
             if start_c and end_c:
                 s_idx = _nearest_index_on_polyline(poly, start_c[0], start_c[1])
                 e_idx = _nearest_index_on_polyline(poly, end_c[0], end_c[1])
                 if s_idx is not None and e_idx is not None and e_idx > s_idx:
                     sub = poly[s_idx:e_idx+1]
-                    segment_coords = sub                                   # ★ mémoriser le tracé du détour
+                    segment_coords = sub
                     df_segment = pd.DataFrame([{"lat": la, "lon": lo, "seg": "troncon"} for la, lo in sub])
 
-                # marqueurs start/end (n’affectent plus le cadrage) ★
+                # marqueurs (non utilisés pour cadrer)
                 df_markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
                 df_markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
 
-            # Arrêts de remplacement (n’affectent plus le cadrage) ★
+            # arrêts de remplacement
             order = 1
             for rs in m.replacement_stops:
                 sid = rs.stop_id
@@ -543,72 +545,105 @@ def _build_altair_layers_for_entity(
                     df_markers.append({"type": "repl", "lat": la_lo[0], "lon": la_lo[1], "label": f"{order}·{sid}"})
                     order += 1
 
-    # 3) Domaine X/Y basé STRICTEMENT sur le tracé GTFS du détour ★
-    #    -> si segment résolu : domaine = segment ; sinon = shape complète.
-    def _compute_domain_from_coords(coords: List[Tuple[float, float]],
-                                    frac: float = 0.03, floor: float = 1e-4) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    # 3) Domaine (pour le mode sans basemap) basé sur le tracé GTFS (segment si dispo)
+    def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor: float = 1e-4):
         if not coords:
             return (-180.0, 180.0), (-90.0, 90.0)
         lats = [la for la, _ in coords]
         lons = [lo for _, lo in coords]
         lat_min, lat_max = min(lats), max(lats)
         lon_min, lon_max = min(lons), max(lons)
-
-        # padding léger pour respirer, mais on reste centré sur le tracé (pas les marqueurs)
         span_lat = max(lat_max - lat_min, floor)
         span_lon = max(lon_max - lon_min, floor)
         pad_lat = max(span_lat * frac, floor)
         pad_lon = max(span_lon * frac, floor)
-
         return (lon_min - pad_lon, lon_max + pad_lon), (lat_min - pad_lat, lat_max + pad_lat)
 
-    coords_for_domain = segment_coords if segment_coords else poly  # ★ choix de base du cadrage
-    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain_from_coords(coords_for_domain)
+    coords_for_domain = segment_coords if segment_coords else poly
+    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain(coords_for_domain)
 
-    if fix_scales:
-        x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
-        y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
-    else:
-        x_scale = alt.Scale()
-        y_scale = alt.Scale()
-
-    # 4) DataFrames -> Altair (scales appliquées partout)
+    # 4) DataFrames
     df_route = pd.DataFrame([{"lat": la, "lon": lo, "seg": "route"} for la, lo in poly])
 
-    base = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
-        x=alt.X("lon:Q", title="Longitude", scale=x_scale),
-        y=alt.Y("lat:Q", title="Latitude",  scale=y_scale)
-    )
-    layers = [base]
+    # 5) Construction des calques
+    layers = []
 
-    if df_segment is not None and not df_segment.empty:
-        layers.append(
-            alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
-                x=alt.X("lon:Q", scale=x_scale),
-                y=alt.Y("lat:Q", scale=y_scale)
-            )
+    if use_basemap:
+        # --- Fond vectoriel (geoshape) ---------------------------------------
+        world = alt.topo_feature(data.world_110m.url, 'countries')  # Natural Earth
+        bg = alt.Chart(world).mark_geoshape(
+            fill="#f5f5f5", stroke="#d9d9d9"
         )
+        layers.append(bg)
 
-    if df_markers:
-        dfm = pd.DataFrame(df_markers)
-        color_scale = alt.Scale(domain=["start", "end", "repl"], range=["#188038", "#202124", "#f9ab00"])
-        layers.append(
-            alt.Chart(dfm).mark_point(size=80, filled=True).encode(
-                x=alt.X("lon:Q", scale=x_scale),
-                y=alt.Y("lat:Q", scale=y_scale),
-                color=alt.Color("type:N", scale=color_scale, legend=alt.Legend(title="Marqueur"))
-            )
+        # --- Route / tronçon / marqueurs en coordonnées géographiques -------
+        route_geo = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
+            longitude='lon:Q', latitude='lat:Q'
         )
-        layers.append(
-            alt.Chart(dfm).mark_text(dy=-10).encode(
-                x=alt.X("lon:Q", scale=x_scale),
-                y=alt.Y("lat:Q", scale=y_scale),
-                text="label:N",
-                color=alt.Color("type:N", scale=color_scale, legend=None)
-            )
-        )
+        layers.append(route_geo)
 
-    chart = alt.layer(*layers).properties(width="container", height=380).interactive()
+        if df_segment is not None and not df_segment.empty:
+            seg_geo = alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
+                longitude='lon:Q', latitude='lat:Q'
+            )
+            layers.append(seg_geo)
+
+        if df_markers:
+            dfm = pd.DataFrame(df_markers)
+            color_scale = alt.Scale(domain=["start","end","repl"], range=["#188038","#202124","#f9ab00"])
+            pts = alt.Chart(dfm).mark_point(size=80, filled=True).encode(
+                longitude='lon:Q', latitude='lat:Q',
+                color=alt.Color('type:N', scale=color_scale, legend=alt.Legend(title="Marqueur"))
+            )
+            labels = alt.Chart(dfm).mark_text(dy=-10).encode(
+                longitude='lon:Q', latitude='lat:Q', text='label:N',
+                color=alt.Color('type:N', scale=color_scale, legend=None)
+            )
+            layers += [pts, labels]
+
+        # Projection commune pour tous les calques
+        chart = alt.layer(*layers).project('mercator').properties(width="container", height=380).interactive()
+
+    else:
+        # --- Mode sans basemap : axes numériques + cadrage contrôlé ----------
+        x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False) if fix_scales else alt.Scale()
+        y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False) if fix_scales else alt.Scale()
+
+        base = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
+            x=alt.X("lon:Q", title="Longitude", scale=x_scale),
+            y=alt.Y("lat:Q", title="Latitude",  scale=y_scale)
+        )
+        layers.append(base)
+
+        if df_segment is not None and not df_segment.empty:
+            layers.append(
+                alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
+                    x=alt.X("lon:Q", scale=x_scale),
+                    y=alt.Y("lat:Q", scale=y_scale)
+                )
+            )
+
+        if df_markers:
+            dfm = pd.DataFrame(df_markers)
+            color_scale = alt.Scale(domain=["start","end","repl"], range=["#188038","#202124","#f9ab00"])
+            layers.append(
+                alt.Chart(dfm).mark_point(size=80, filled=True).encode(
+                    x=alt.X("lon:Q", scale=x_scale),
+                    y=alt.Y("lat:Q", scale=y_scale),
+                    color=alt.Color("type:N", scale=color_scale, legend=alt.Legend(title="Marqueur"))
+                )
+            )
+            layers.append(
+                alt.Chart(dfm).mark_text(dy=-10).encode(
+                    x=alt.X("lon:Q", scale=x_scale),
+                    y=alt.Y("lat:Q", scale=y_scale),
+                    text="label:N",
+                    color=alt.Color("type:N", scale=color_scale, legend=None)
+                )
+            )
+
+        chart = alt.layer(*layers).properties(width="container", height=380).interactive()
+
     return chart
 
 # ----------------------------------------------------------------------------- 
