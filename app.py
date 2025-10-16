@@ -568,19 +568,19 @@ def _build_altair_layers_for_entity(
     # 5) Construction des calques
     layers = []
 
-    if use_basemap:
-        # --- Fond vectoriel (geoshape) ---------------------------------------
-        world = alt.topo_feature(data.world_110m.url, 'countries')  # Natural Earth
+if use_basemap:
+        # --- Fond carto vectoriel (Natural Earth) ---------------------------
+        world = alt.topo_feature(data.world_110m.url, 'countries')
         bg = alt.Chart(world).mark_geoshape(
             fill="#f5f5f5", stroke="#d9d9d9"
         )
-        layers.append(bg)
 
-        # --- Route / tronçon / marqueurs en coordonnées géographiques -------
+        # --- Lignes / Tronçon / Marqueurs encodés en canaux géographiques ---
         route_geo = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
             longitude='lon:Q', latitude='lat:Q'
         )
-        layers.append(route_geo)
+
+        layers = [bg, route_geo]
 
         if df_segment is not None and not df_segment.empty:
             seg_geo = alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
@@ -601,8 +601,31 @@ def _build_altair_layers_for_entity(
             )
             layers += [pts, labels]
 
-        # Projection commune pour tous les calques
-        chart = alt.layer(*layers).project('mercator').properties(width="container", height=380).interactive()
+        # --- NOUVEAU : projection FIT sur le BBOX du détour -----------------
+        # On utilise le domaine déjà calculé (lon_min/max, lat_min/max), avec padding,
+        # pour construire un polygone GeoJSON de cadrage.
+        fit_feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [lon_min, lat_min],
+                    [lon_min, lat_max],
+                    [lon_max, lat_max],
+                    [lon_max, lat_min],
+                    [lon_min, lat_min]
+                ]]
+            },
+            "properties": {}
+        }
+
+        chart = (
+            alt.layer(*layers)
+               .project(type='mercator', fit=fit_feature)  # <-- ajuste centre + échelle automatiquement
+               .properties(width="container", height=380)
+               .interactive()
+        )
+
 
     else:
         # --- Mode sans basemap : axes numériques + cadrage contrôlé ----------
