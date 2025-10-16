@@ -658,7 +658,8 @@ with st.sidebar:
     gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
     tripmods_file = st.file_uploader("TripModifications (.json/.pb)", type=["json", "pb", "pbf", "bin"])
     dump_first = st.checkbox("Afficher le 1er trip_mod normalisé", value=False)
-    fix_scales = st.checkbox("Ajuster l’échelle des axes (sans zéro)", value=True)  # nouveau
+    fix_scales = st.checkbox("Ajuster l’échelle des axes (sans zéro)", value=True)
+    use_basemap = st.checkbox("Afficher le fond carto (geoshape)", value=True)  # ⬅️ nouveau
     run_btn = st.button("Analyser", type="primary")
 
 if run_btn:
@@ -731,7 +732,7 @@ if run_btn:
             # Visualisation Altair (route + tronçon + marqueurs) avec scales contrôlées
             ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
             if ent_obj:
-                chart = _build_altair_layers_for_entity(ent_obj, rt, gtfs, fix_scales=fix_scales)
+                chart = _build_altair_layers_for_entity(ent_obj, rt, gtfs, fix_scales=fix_scales, use_basemap=use_basemap)
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
                 else:
