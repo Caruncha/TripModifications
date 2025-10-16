@@ -625,8 +625,6 @@ if use_basemap:
                .properties(width="container", height=380)
                .interactive()
         )
-
-
     else:
         # --- Mode sans basemap : axes numériques + cadrage contrôlé ----------
         x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False) if fix_scales else alt.Scale()
