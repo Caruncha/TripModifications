@@ -6,6 +6,7 @@
 # - Visualisation Altair : ligne + points rouges, ordre explicite (idx)
 # - GTFS filtré (mémoire réduite) ; tableau Détails avec colonnes d'anomalies
 # - UI : KPI "Shapes dans le feed", et "Shape utilisé pour le tracé" dans chaque entité
+# - Détails : n'affiche QUE les entités qui ont réellement un bloc trip_modifications
 # ---------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -413,10 +414,9 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
 
     for line in _lines(b):
         if not line:
-            # lignes vides : si on capturait l'encoded polyline, on continue (elles peuvent faire partie du flux échappé)
             continue
 
-        # Si on capturait la polyline, on regarde si la ligne marque un nouveau bloc
+        # Capture continuée pour l'encoded polyline (lignes suivantes)
         if capturing_poly:
             if (line.startswith('id ') or line.startswith('entity') or
                 line.startswith('shape_id ') or line.startswith('trip_modifications') or
@@ -425,15 +425,12 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
                 line.startswith('modifications ') or line.startswith('start_stop_selector') or
                 line.startswith('end_stop_selector') or line.startswith('replacement_stops') or
                 line.startswith('encoded_polyline ')):
-                # fin de capture, on NE consomme PAS la ligne : on la retraitera ci-dessous
                 capturing_poly = False
-                # pas de 'continue' ici — on laisse la ligne être traitée plus bas
             else:
-                # concaténation de la chaîne encodée
                 shape_buf['encoded_polyline'] = shape_buf.get('encoded_polyline', '') + line
                 continue
 
-        # Début d'une nouvelle entité
+        # Nouvelle entité
         if line.startswith('entity') or line.startswith('id '):
             new_id = None
             if line.startswith('id '):
@@ -454,11 +451,9 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
             in_tm, in_shape, capturing_poly = False, True, False
             shape_buf = {}
             continue
-
         # --- Bloc Trip Modifications ---
         if in_tm:
             if line.startswith('selected_trips'):
-                # marqueur seulement ; on créera/complètera SelectedTrips avec trip_ids/shape_id
                 continue
             if line.startswith('trip_ids '):
                 ids = line[len('trip_ids '):].strip().split()
@@ -479,7 +474,6 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
                 tm_buf['start_times'] += line[len('start_times '):].strip().split()
                 continue
             if line.startswith('modifications'):
-                # marqueur ; la 1re occurrence de start_stop_selector démarrera un Modification si besoin
                 continue
             if line.startswith('start_stop_selector'):
                 tm_buf['modifications'].append(Modification(
@@ -520,7 +514,6 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
                         ReplacementStop(stop_id=sid, travel_time_to_stop=0)
                     )
                 continue
-            # autres lignes ignorées côté TM
             continue
 
         # --- Bloc Shape ---
@@ -533,7 +526,6 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
                 shape_buf['encoded_polyline'] = enc
                 capturing_poly = True
                 continue
-            # autres lignes ignorées (ex: bruit)
             continue
 
     # flush final
@@ -756,7 +748,8 @@ def build_chart_for_polyline(poly: List[Tuple[float, float]], shape_id: Optional
 st.set_page_config(page_title="Analyse TripModifications + GTFS — JSON/PB/Textproto + polylines", layout="wide")
 st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Mémoire réduite")
 st.caption("Les polylines sont nettoyées (déséchappage léger), décodées (Auto/1e‑5/1e‑6) et affichées avec des points rouges. "
-           "Support du format textproto (dump ASCII GTFS‑RT) — séparation claire entre entités TripMods et Shapes.")
+           "Support du format textproto (dump ASCII GTFS‑RT) — séparation claire entre entités TripMods et Shapes. "
+           "Dans la section **Détails**, seules les entités possédant un **trip_modifications** sont affichées.")
 
 with st.sidebar:
     st.header("Données d’entrée")
@@ -801,10 +794,13 @@ if run_btn:
         except Exception as ex:
             st.exception(ex); st.stop()
 
-    # --- KPI (incl. shapes dans le feed) ---
-    reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
+    # --- Analyse ---
+    with st.spinner("Analyse en cours…"):
+        reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
+
     total_shapes = len(rt_shapes.shapes)
 
+    # KPIs (incl. shapes dans le feed)
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Entités", totals["total_entities"])
     c2.metric("trip_ids sélectionnés", totals["total_trip_ids"])
@@ -839,130 +835,100 @@ if run_btn:
     st.subheader("Synthèse par entité")
     st.dataframe(table, width="stretch", height=360)
 
-    # Détails + tracé par entité
+    # --- Détails + tracé par entité (AFFICHER UNIQUEMENT si trip_modifications présent) ---
     st.subheader("Détails")
     for r in reports[:200]:
+        # Récupère l'entité source issue du parseur trip_modifications
+        ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
+
+        # ✅ Filtre : n'afficher que si l'entité a un bloc trip_modifications (au moins 1 modif)
+        if not ent_obj or not ent_obj.modifications:
+            continue
+
         with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
             st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
             st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
                      ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
 
-            # Rattache l'objet entité pour récupérer les shape_id
-            ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
-            shape_ids_in_entity = []
-            if ent_obj:
-                for s in ent_obj.selected_trips:
-                    if s.shape_id:
-                        shape_ids_in_entity.append(s.shape_id)
+            # Liste des shape_id déclarés côté selected_trips (utile pour le tracé)
+            shape_ids_in_entity = [s.shape_id for s in ent_obj.selected_trips if s.shape_id]
             shape_ids_set = set(shape_ids_in_entity)
             mixed_shapes = len([sid for sid in shape_ids_set if sid]) > 1
 
-            # Comptage duplications de trip dans l'entité
+            # Comptage des trips dupliqués dans l'entité
             trip_counts: Dict[str, int] = {}
-            if ent_obj:
-                for s in ent_obj.selected_trips:
-                    for tid in s.trip_ids:
-                        trip_counts[tid] = trip_counts.get(tid, 0) + 1
+            for s in ent_obj.selected_trips:
+                for tid in s.trip_ids:
+                    trip_counts[tid] = trip_counts.get(tid, 0) + 1
 
-            # Shape utilisé pour le tracé : premier shape_id de l'entité présent dans rt_shapes
+            # Shape utilisé pour le tracé : premier shape_id disponible dans rt_shapes
             shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
             st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
 
-# --- Détails + tracé par entité (filtré sur les vraies entités TripModifications) ---
-st.subheader("Détails")
-for r in reports[:200]:
-    # On récupère l'entité "source" (issue du parseur trip_modifications)
-    ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
+            # Détails (diagnostics)
+            detail_rows = []
+            for t in r.trips:
+                st_list = gtfs.stop_times.get(t.trip_id, [])
+                stop_times_count = len(st_list)
 
-    # ✅ Filtre : on affiche les détails UNIQUEMENT si l'entité contient un trip_modifications
-    if not ent_obj or not ent_obj.modifications:
-        continue
+                # shape_id associé à CE trip (dans le contexte entité)
+                trip_shape_id = None
+                for s in ent_obj.selected_trips:
+                    if t.trip_id in s.trip_ids and s.shape_id:
+                        trip_shape_id = s.shape_id
+                        break
+                if not trip_shape_id and shape_ids_in_entity:
+                    trip_shape_id = shape_ids_in_entity[0]
 
-    with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
-        st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
+                poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
+                poly_points = len(poly)
 
-        # Liste des shape_id déclarés côté selected_trips (utile pour le tracé)
-        shape_ids_in_entity = []
-        for s in ent_obj.selected_trips:
-            if s.shape_id:
-                shape_ids_in_entity.append(s.shape_id)
-        shape_ids_set = set(shape_ids_in_entity)
-        mixed_shapes = len([sid for sid in shape_ids_set if sid]) > 1
+                def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
+                    if not coords or len(coords) < 2: return True
+                    lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
+                    return (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4
 
-        # Comptage des trips dupliqués dans l'entité
-        trip_counts: Dict[str, int] = {}
-        for s in ent_obj.selected_trips:
-            for tid in s.trip_ids:
-                trip_counts[tid] = trip_counts.get(tid, 0) + 1
+                poly_anormal = _is_poly_anormal(poly)
+                selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
+                ordre_ok = ""
+                ecart_seq = ""
+                if (t.start_seq is not None) and (t.end_seq is not None):
+                    ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
+                    ecart_seq = t.end_seq - t.start_seq
+                duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
 
-        # Shape utilisé pour le tracé : premier shape_id disponible dans rt_shapes
-        shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
-        st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
+                detail_rows.append({
+                    "trip_id": t.trip_id,
+                    "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
+                    "start_seq": t.start_seq if t.start_seq is not None else "",
+                    "end_seq": t.end_seq if t.end_seq is not None else "",
+                    "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
+                    "notes": "; ".join(t.notes) if t.notes else "",
+                    # Anomalies / diagnostics
+                    "shape_id (trip)": trip_shape_id or "",
+                    "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
+                    "pts polyline": poly_points,
+                    "polyline anormale": "oui" if poly_anormal else "non",
+                    "stop_times (nb)": stop_times_count,
+                    "ordre start<=end": ordre_ok,
+                    "écart seq": ecart_seq,
+                    "selectors incomplets": "oui" if selectors_incomplets else "non",
+                    "trip en double (entité)": "oui" if duplicate_trip else "non",
+                    "mixed shapes (entité)": "oui" if mixed_shapes else "non",
+                })
 
-        # Tableau Détails (diagnostics)
-        detail_rows = []
-        for t in r.trips:
-            st_list = gtfs.stop_times.get(t.trip_id, [])
-            stop_times_count = len(st_list)
+            st.dataframe(detail_rows, width="stretch", height=260)
 
-            # shape_id associé à CE trip (dans le contexte entité)
-            trip_shape_id = None
-            for s in ent_obj.selected_trips:
-                if t.trip_id in s.trip_ids and s.shape_id:
-                    trip_shape_id = s.shape_id
-                    break
-            if not trip_shape_id and shape_ids_in_entity:
-                trip_shape_id = shape_ids_in_entity[0]
-
-            poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
-            poly_points = len(poly)
-
-            def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
-                if not coords or len(coords) < 2: return True
-                lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
-                return (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4
-
-            poly_anormal = _is_poly_anormal(poly)
-            selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
-            ordre_ok = ""
-            ecart_seq = ""
-            if (t.start_seq is not None) and (t.end_seq is not None):
-                ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
-                ecart_seq = t.end_seq - t.start_seq
-            duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
-
-            detail_rows.append({
-                "trip_id": t.trip_id,
-                "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
-                "start_seq": t.start_seq if t.start_seq is not None else "",
-                "end_seq": t.end_seq if t.end_seq is not None else "",
-                "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
-                "notes": "; ".join(t.notes) if t.notes else "",
-                # Anomalies / diagnostics
-                "shape_id (trip)": trip_shape_id or "",
-                "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
-                "pts polyline": poly_points,
-                "polyline anormale": "oui" if poly_anormal else "non",
-                "stop_times (nb)": stop_times_count,
-                "ordre start<=end": ordre_ok,
-                "écart seq": ecart_seq,
-                "selectors incomplets": "oui" if selectors_incomplets else "non",
-                "trip en double (entité)": "oui" if duplicate_trip else "non",
-                "mixed shapes (entité)": "oui" if mixed_shapes else "non",
-            })
-
-        st.dataframe(detail_rows, width="stretch", height=260)
-
-        # Tracé (si shape dispo)
-        if shape_id_for_plot:
-            poly = rt_shapes.shapes.get(shape_id_for_plot, [])
-            chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot, show_index_labels=False)
-            if chart is not None:
-                st.altair_chart(chart, use_container_width=True)
+            # Tracé (si shape dispo)
+            if shape_id_for_plot:
+                poly = rt_shapes.shapes.get(shape_id_for_plot, [])
+                chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot, show_index_labels=False)
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.info("Polyline vide ou invalide pour cette entité.")
             else:
-                st.info("Polyline vide ou invalide pour cette entité.")
-        else:
-            st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
+                st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
 
     # Export JSON
     report_json = {"totals": totals, "total_shapes": total_shapes, "entities": [asdict(r) for r in reports]}
