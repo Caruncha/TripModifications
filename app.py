@@ -1,17 +1,17 @@
-# app.py — Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite + tracé encoded_polyline
-# -----------------------------------------------------------------------------------------------
+# app.py — Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite + tracé encoded_polyline + Anomalies
+# ------------------------------------------------------------------------------------------------------------
 # Nouveautés :
-# - Décodage des polylines via la librairie 'polyline' (auto-détection précision 1e5 / 1e6),
-#   avec repli sur un décodeur interne si la dépendance n'est pas installée.
-# - Le tracé est cadré sur (min/max) lon/lat du chemin (padding léger), sans fond de carte.
+# - Colonnes d'anomalies dans la section "Détails" (par trip) : structure & données.
+# - Décodage des polylines via 'polyline' (auto-détection précision 1e5/1e6), avec fallback interne.
+# - Cadrage auto du tracé sur min/max(lon/lat) (pas de fond de carte).
 #
-# Dépendances utiles :
-#   pip install streamlit altair pandas polyline
-# -----------------------------------------------------------------------------------------------
+# Dépendances conseillées :
+#   pip install streamlit pandas altair polyline
+# ------------------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
 import streamlit as st
-import json, csv, io, zipfile, sys, re, math
+import json, csv, io, zipfile, sys, re
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple, Set
 from pathlib import Path
@@ -19,9 +19,9 @@ from pathlib import Path
 import pandas as pd
 import altair as alt
 
-# -----------------------------------------------------------------------------------------------
-# 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
+# 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine si besoin)
+# ------------------------------------------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -30,17 +30,15 @@ try:
 except Exception:
     gtfs_local = None
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 1) PATCH camelCase → snake_case (normalisation récursive des clés JSON)
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 _CAMEL_RE = re.compile(r'(?<!^)(?=[A-Z])')
 
 def _camel_to_snake(name: str) -> str:
-    """Ex.: 'startStopSelector' -> 'start_stop_selector' """
     return _CAMEL_RE.sub('_', name).lower()
 
 def _normalize_json_keys(obj):
-    """Convertit récursivement les clés dict en snake_case (listes/valeurs conservées)."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -51,9 +49,9 @@ def _normalize_json_keys(obj):
         return [_normalize_json_keys(x) for x in obj]
     return obj
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 2) Modèles
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 @dataclass
 class StopSelector:
     stop_sequence: Optional[int] = None
@@ -86,10 +84,9 @@ class TripModEntity:
 
 @dataclass
 class GtfsStatic:
-    # Structures filtrées minimales
-    trips: Dict[str, Dict[str, str]]                   # trip_id -> row (présence)
-    stop_times: Dict[str, List[Dict[str, str]]]        # trip_id -> [rows triées]
-    stops_present: Set[str]                             # ensemble de stop_id présents
+    trips: Dict[str, Dict[str, str]]
+    stop_times: Dict[str, List[Dict[str, str]]]
+    stops_present: Set[str]
 
 @dataclass
 class TripCheck:
@@ -114,17 +111,16 @@ class EntityReport:
 class RtShapes:
     shapes: Dict[str, List[Tuple[float, float]]]  # shape_id -> [(lat, lon), ...]
 
-# -----------------------------------------------------------------------------------------------
-# 3) Décodage polyline — via librairie 'polyline' (auto 1e5/1e6) avec repli interne
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
+# 3) Décodage polyline via 'polyline' (auto 1e5/1e6) + fallback interne
+# ------------------------------------------------------------------------------------------------------------
 def _legacy_decode_polyline(encoded: str) -> List[Tuple[float, float]]:
-    """Décodeur interne (fallback) — algorithme Google standard (précision 1e5)."""
     coords = []
     index, lat, lon = 0, 0, 0
     encoded = (encoded or "").strip()
     L = len(encoded)
     while index < L:
-        # latitude
+        # lat
         result = 0; shift = 0
         while True:
             b = ord(encoded[index]) - 63; index += 1
@@ -132,7 +128,7 @@ def _legacy_decode_polyline(encoded: str) -> List[Tuple[float, float]]:
             if b < 0x20: break
         dlat = ~(result >> 1) if (result & 1) else (result >> 1)
         lat += dlat
-        # longitude
+        # lon
         result = 0; shift = 0
         while True:
             b = ord(encoded[index]) - 63; index += 1
@@ -142,67 +138,48 @@ def _legacy_decode_polyline(encoded: str) -> List[Tuple[float, float]]:
         lon += dlon
         coords.append((lat / 1e5, lon / 1e5))
     return coords
+
 def _bbox_span(coords: List[Tuple[float,float]]) -> float:
-    if not coords:
-        return 0.0
+    if not coords: return 0.0
     lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
     return (max(lats)-min(lats)) + (max(lons)-min(lons))
 
 def decode_polyline_smart(encoded: str) -> List[Tuple[float, float]]:
-    """
-    Tente d'abord le décodage avec la librairie 'polyline' :
-      - precision=5 (1e5), si hors bornes → precision=6 (1e6)
-      - si les deux sont plausibles, on compare le "span" et on choisit le plus réaliste.
-    Repli : décodeur interne 1e5.
-    """
     encoded = (encoded or "").strip()
     if not encoded:
         return []
-
     try:
         import polyline as pl
     except Exception:
-        # Librairie non installée → fallback
         return _legacy_decode_polyline(encoded)
-
-    # 1) Essai précision 5
+    # precision=5
+    def _valid(cs): 
+        return cs and all(-90 <= la <= 90 and -180 <= lo <= 180 for la,lo in cs)
     try:
         c5 = pl.decode(encoded, precision=5)
     except Exception:
         c5 = []
-
-    # Hors bornes ? → essai précision 6
-    def _valid(cs): 
-        return cs and all(-90 <= la <= 90 and -180 <= lo <= 180 for la,lo in cs)
-
     if not _valid(c5):
         try:
             c6 = pl.decode(encoded, precision=6)
             return c6 if _valid(c6) else _legacy_decode_polyline(encoded)
         except Exception:
             return _legacy_decode_polyline(encoded)
-
-    # 2) Essai précision 6 aussi (pour comparer les spans)
+    # compare with precision=6
     try:
         c6 = pl.decode(encoded, precision=6)
     except Exception:
         c6 = []
-
     if not _valid(c6):
-        return c5  # seul plausible
-
-    # 3) Choix heuristique : si les spans diffèrent sensiblement, on garde le plus plausible.
-    s5, s6 = _bbox_span(c5), _bbox_span(c6)
-    if s6 > 1.5 * s5:
-        return c6
-    if s5 > 1.5 * s6:
         return c5
-    # Sinon, par défaut on reste sur précision 5 (GTFS classique)
+    s5, s6 = _bbox_span(c5), _bbox_span(c6)
+    if s6 > 1.5 * s5: return c6
+    if s5 > 1.5 * s6: return c5
     return c5
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 4) Parsing TripModifications & Shapes
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 def _detect_tripmods_format_bytes(b: bytes) -> str:
     head = (b[:2] or b'').lstrip()
     return 'json' if head.startswith(b'{') or head.startswith(b'[') else 'pb'
@@ -363,15 +340,10 @@ def _collect_shapes_pb(data: bytes) -> RtShapes:
     return RtShapes(shapes=shapes)
 
 def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], Optional[Dict[str, Any]], RtShapes]:
-    """
-    Retourne (entities, feed_json_normalisé_ou_None, shapes).
-    - Si JSON : normalise camelCase→snake_case puis parse + collecte des shapes.
-    - Si PB : parse protobuf + collecte des shapes (depuis le Protobuf).
-    """
     fmt = _detect_tripmods_format_bytes(file_bytes)
     if fmt == 'json':
         raw = json.loads(file_bytes.decode('utf-8'))
-        feed = _normalize_json_keys(raw)  # <-- normalisation des clés
+        feed = _normalize_json_keys(raw)
         ents = parse_tripmods_json(feed)
         shapes = _collect_shapes_json(feed)
         needed_shape_ids = {s.shape_id for e in ents for s in e.selected_trips if s.shape_id}
@@ -386,9 +358,9 @@ def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], Optiona
             shapes.shapes = {sid: poly for sid, poly in shapes.shapes.items() if sid in needed_shape_ids}
         return ents, None, shapes
 
-# -----------------------------------------------------------------------------------------------
-# 5) Ensembles cibles (pour filtrer le GTFS)
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
+# 5) Ensembles cibles pour filtrer le GTFS
+# ------------------------------------------------------------------------------------------------------------
 def compute_needed_sets(ents: List[TripModEntity]) -> Tuple[Set[str], Set[str]]:
     needed_trip_ids: Set[str] = set()
     needed_stop_ids: Set[str] = set()
@@ -404,9 +376,9 @@ def compute_needed_sets(ents: List[TripModEntity]) -> Tuple[Set[str], Set[str]]:
                     needed_stop_ids.add(str(sel.stop_id))
     return needed_trip_ids, needed_stop_ids
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 6) Chargement GTFS FILTRÉ
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 def load_gtfs_zip_filtered_bytes(
     zip_bytes: bytes,
     needed_trip_ids: Set[str],
@@ -420,15 +392,12 @@ def load_gtfs_zip_filtered_bytes(
         return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present)
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-        # trips.txt
         if 'trips.txt' in zf.namelist() and needed_trip_ids:
             with zf.open('trips.txt') as f:
                 for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
                     tid = (row.get('trip_id') or '').strip()
                     if tid in needed_trip_ids:
                         trips[tid] = {k: (v or "").strip() for k, v in row.items()}
-
-        # stop_times.txt
         if 'stop_times.txt' in zf.namelist() and needed_trip_ids:
             with zf.open('stop_times.txt') as f:
                 reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline=''))
@@ -443,8 +412,6 @@ def load_gtfs_zip_filtered_bytes(
                         stop_times.setdefault(tid, []).append(rec)
             for tid, lst in stop_times.items():
                 lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
-
-        # stops.txt
         if 'stops.txt' in zf.namelist() and needed_stop_ids:
             with zf.open('stops.txt') as f:
                 for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
@@ -454,9 +421,9 @@ def load_gtfs_zip_filtered_bytes(
 
     return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present)
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 7) Analyse
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]]) -> Optional[int]:
     if sel is None:
         return None
@@ -475,12 +442,10 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
     reports: List[EntityReport] = []
     totals = dict(total_entities=len(ents), total_trip_ids=0, total_modifications=0,
                   missing_trip_ids=0, invalid_selectors=0, unknown_replacement_stops=0)
-
     for e in ents:
         trip_checks: List[TripCheck] = []
         repl_unknown: List[str] = []
         tot_trip_ids = sum(len(sel.trip_ids) for sel in e.selected_trips)
-
         for sel in e.selected_trips:
             for trip_id in sel.trip_ids:
                 exists = trip_id in gtfs.trips
@@ -500,25 +465,22 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                         if end_seq is None and eseq is not None:
                             end_seq = eseq
                         if sseq is None or eseq is None:
-                            notes.append("start/end selector non résolu sur ce trip (données filtrées insuffisantes ?)")
+                            notes.append("start/end selector non résolu sur ce trip")
                             totals["invalid_selectors"] += 1
                         else:
                             start_ok = True
                             end_ok = True
-
                 trip_checks.append(TripCheck(
                     trip_id=trip_id, exists_in_gtfs=exists,
                     start_seq_valid=start_ok, end_seq_valid=end_ok,
                     start_seq=start_seq, end_seq=end_seq, notes=notes
                 ))
-
         for m in e.modifications:
             for rs in m.replacement_stops:
                 sid = rs.stop_id
                 if sid and sid not in gtfs.stops_present:
                     repl_unknown.append(sid)
                     totals["unknown_replacement_stops"] += 1
-
         totals["total_trip_ids"] += tot_trip_ids
         totals["total_modifications"] += len(e.modifications)
         reports.append(EntityReport(
@@ -529,14 +491,12 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
             trips=trip_checks,
             replacement_stops_unknown_in_gtfs=sorted(set(repl_unknown))
         ))
-
     return reports, totals
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 8) Visualisation Altair — polyline (shape) à l’échelle
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor: float = 1e-4):
-    """Retourne (lon_min, lon_max), (lat_min, lat_max) avec un padding léger."""
     if not coords:
         return (-180.0, 180.0), (-90.0, 90.0)
     lats = [la for la, _ in coords]
@@ -550,7 +510,6 @@ def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor
     return (lon_min - pad_lon, lon_max + pad_lon), (lat_min - pad_lat, lat_max + pad_lat)
 
 def build_chart_for_polyline(poly: List[Tuple[float, float]], shape_id: Optional[str] = None) -> Optional[alt.Chart]:
-    """Construit un chart Altair pour une polyline, cadré automatiquement."""
     if not poly or len(poly) < 2:
         return None
     df_route = pd.DataFrame([{"lat": la, "lon": lo} for la, lo in poly])
@@ -570,13 +529,13 @@ def build_chart_for_polyline(poly: List[Tuple[float, float]], shape_id: Optional
     )
     return chart
 
-# -----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------
 # 9) UI Streamlit
-# -----------------------------------------------------------------------------------------------
-st.set_page_config(page_title="Analyse TripModifications + GTFS — Mémoire réduite + polyline", layout="wide")
+# ------------------------------------------------------------------------------------------------------------
+st.set_page_config(page_title="Analyse TripModifications + GTFS — Mémoire réduite + polyline + Anomalies", layout="wide")
 st.title("Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite")
 st.caption("Le JSON est normalisé (camelCase → snake_case). Le GTFS est filtré. "
-           "Chaque entité affiche le tracé 'encoded_polyline' (si fourni dans le feed TripModifications).")
+           "Chaque entité affiche le tracé 'encoded_polyline' (si fourni) et un tableau de détails avec anomalies.")
 
 with st.sidebar:
     st.header("Données d’entrée")
@@ -649,7 +608,7 @@ if run_btn:
     st.subheader("Synthèse par entité")
     st.dataframe(table, use_container_width=True, height=360)
 
-    # Détails par entité + tracé encoded_polyline
+    # 4) Détails par entité (avec colonnes d'anomalies)
     st.subheader("Détails")
     for r in reports[:200]:
         with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
@@ -657,29 +616,98 @@ if run_btn:
             st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
                      ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
 
-            # Tableau par trip
-            detail_rows = [{
-                "trip_id": t.trip_id,
-                "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
-                "start_seq": t.start_seq if t.start_seq is not None else "",
-                "end_seq": t.end_seq if t.end_seq is not None else "",
-                "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
-                "notes": "; ".join(t.notes) if t.notes else ""
-            } for t in r.trips]
-            st.dataframe(detail_rows, use_container_width=True, height=220)
-
-            # --- Tracé encoded_polyline (si shape disponible) ----------------
+            # Récupère l'objet entité correspondant + contexte de formes
             ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
-            shape_id = None
+            shape_ids_in_entity = []
             if ent_obj:
                 for s in ent_obj.selected_trips:
-                    if s.shape_id and s.shape_id in rt_shapes.shapes:
-                        shape_id = s.shape_id
-                        break
+                    if s.shape_id:
+                        shape_ids_in_entity.append(s.shape_id)
+            shape_ids_set = set(shape_ids_in_entity)
+            mixed_shapes = len([sid for sid in shape_ids_set if sid]) > 1
 
-            if shape_id:
-                poly = rt_shapes.shapes.get(shape_id, [])
-                chart = build_chart_for_polyline(poly, shape_id=shape_id)
+            # Comptage des trip duplications dans l'entité
+            trip_counts: Dict[str, int] = {}
+            if ent_obj:
+                for s in ent_obj.selected_trips:
+                    for tid in s.trip_ids:
+                        trip_counts[tid] = trip_counts.get(tid, 0) + 1
+
+            # Prépare le tableau détail avec colonnes d'anomalies
+            detail_rows = []
+            for t in r.trips:
+                # stop_times count
+                st_list = gtfs.stop_times.get(t.trip_id, [])
+                stop_times_count = len(st_list)
+
+                # shape_id de référence pour CE trip
+                trip_shape_id = None
+                if ent_obj:
+                    for s in ent_obj.selected_trips:
+                        if t.trip_id in s.trip_ids and s.shape_id:
+                            trip_shape_id = s.shape_id
+                            break
+                # fallback : 1er shape de l'entité
+                if not trip_shape_id and shape_ids_in_entity:
+                    trip_shape_id = shape_ids_in_entity[0]
+
+                # disponibilité + métriques polyline
+                poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
+                poly_points = len(poly)
+                # "anormal" si bbox très petite (dégénéré) :
+                def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
+                    if not coords or len(coords) < 2:
+                        return True
+                    lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
+                    if (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4:
+                        return True
+                    return False
+                poly_anormal = _is_poly_anormal(poly)
+
+                # anomalies selectors
+                selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
+                ordre_ok = ""
+                ecart_seq = ""
+                if (t.start_seq is not None) and (t.end_seq is not None):
+                    ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
+                    ecart_seq = t.end_seq - t.start_seq
+
+                # duplication
+                duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
+
+                detail_rows.append({
+                    "trip_id": t.trip_id,
+                    "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
+                    "start_seq": t.start_seq if t.start_seq is not None else "",
+                    "end_seq": t.end_seq if t.end_seq is not None else "",
+                    "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
+                    "notes": "; ".join(t.notes) if t.notes else "",
+                    # --- Anomalies / diagnostics ---
+                    "shape_id (trip)": trip_shape_id or "",
+                    "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
+                    "pts polyline": poly_points,
+                    "polyline anormale": "oui" if poly_anormal else "non",
+                    "stop_times (nb)": stop_times_count,
+                    "ordre start<=end": ordre_ok,
+                    "écart seq": ecart_seq,
+                    "selectors incomplets": "oui" if selectors_incomplets else "non",
+                    "trip en double (entité)": "oui" if duplicate_trip else "non",
+                    "mixed shapes (entité)": "oui" if mixed_shapes else "non",
+                    "repl_stops inconnus (entité)": len(r.replacement_stops_unknown_in_gtfs)
+                })
+
+            st.dataframe(detail_rows, use_container_width=True, height=260)
+
+            # --- Tracé encoded_polyline (une vue par entité) -----------------
+            # on choisit le 1er shape_id disponible de l'entité
+            shape_id_for_plot = None
+            for sid in shape_ids_in_entity:
+                if sid in rt_shapes.shapes:
+                    shape_id_for_plot = sid
+                    break
+            if shape_id_for_plot:
+                poly = rt_shapes.shapes.get(shape_id_for_plot, [])
+                chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot)
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
                 else:
@@ -687,7 +715,7 @@ if run_btn:
             else:
                 st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
 
-    # Export JSON
+    # Export JSON (résultats agrégés)
     report_json = {"totals": totals, "entities": [asdict(r) for r in reports]}
     st.download_button(
         "📥 Télécharger le rapport JSON",
@@ -698,4 +726,4 @@ if run_btn:
 
 else:
     st.info("Charge un TripModifications (.json/.pb) puis un GTFS (.zip), et clique **Analyser**.")
-    st.caption("Les shapes (encoded_polyline) sont lues depuis le feed TripModifications ; le GTFS est filtré.")
+    st.caption("Les shapes (encoded_polyline) sont lues depuis le feed TripModifications ; le GTFS est filtré, et des colonnes d'anomalies aident à diagnostiquer les données.")
