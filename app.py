@@ -1,13 +1,23 @@
+# app.py — Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite
+# -----------------------------------------------------------------------------
+# Points clés :
+# - Parse TripModifications en premier puis construit des ensembles cibles :
+#     needed_trip_ids / needed_stop_ids
+# - Chargement GTFS FILTRÉ : ne lit que les lignes nécessaires (trips/stop_times/stops)
+# - Affichage : KPIs + Synthèse par entité + Détails (tableaux) — PAS de cartes
+# - PATCH camelCase → snake_case : normalise récursivement les clés JSON avant parsing
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 import streamlit as st
-import json, csv, io, zipfile, sys
+import json, csv, io, zipfile, sys, re
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple, Set
 from pathlib import Path
 
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
 # 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -16,9 +26,30 @@ try:
 except Exception:
     gtfs_local = None
 
-# ----------------------------------------------------------------------------- #
-# 1) Modèles
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
+# 1) PATCH camelCase → snake_case (normalisation récursive des clés JSON)
+# -----------------------------------------------------------------------------
+_CAMEL_RE = re.compile(r'(?<!^)(?=[A-Z])')
+
+def _camel_to_snake(name: str) -> str:
+    """Ex.: 'startStopSelector' -> 'start_stop_selector' """
+    return _CAMEL_RE.sub('_', name).lower()
+
+def _normalize_json_keys(obj):
+    """Convertit récursivement les clés dict en snake_case (listes et valeurs conservées)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            nk = _camel_to_snake(k) if isinstance(k, str) else k
+            out[nk] = _normalize_json_keys(v)
+        return out
+    if isinstance(obj, list):
+        return [_normalize_json_keys(x) for x in obj]
+    return obj
+
+# -----------------------------------------------------------------------------
+# 2) Modèles
+# -----------------------------------------------------------------------------
 @dataclass
 class StopSelector:
     stop_sequence: Optional[int] = None
@@ -51,10 +82,10 @@ class TripModEntity:
 
 @dataclass
 class GtfsStatic:
-    # Structures filtrées, minimales et suffisantes pour l’analyse
-    trips: Dict[str, Dict[str, str]]                       # only needed trips
-    stop_times: Dict[str, List[Dict[str, str]]]            # only needed trips' stop_times (trip_id -> rows sorted by stop_sequence)
-    stops_present: Set[str]                                 # only needed stops (id set)
+    # Structures filtrées minimales
+    trips: Dict[str, Dict[str, str]]                   # trip_id -> row (présence)
+    stop_times: Dict[str, List[Dict[str, str]]]        # trip_id -> [rows triées]
+    stops_present: Set[str]                             # ensemble de stop_id présents
 
 @dataclass
 class TripCheck:
@@ -75,9 +106,9 @@ class EntityReport:
     trips: List[TripCheck]
     replacement_stops_unknown_in_gtfs: List[str] = field(default_factory=list)
 
-# ----------------------------------------------------------------------------- #
-# 2) Parsing TripModifications
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
+# 3) Parsing TripModifications
+# -----------------------------------------------------------------------------
 def _detect_tripmods_format_bytes(b: bytes) -> str:
     head = (b[:2] or b'').lstrip()
     return 'json' if head.startswith(b'{') or head.startswith(b'[') else 'pb'
@@ -203,39 +234,43 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
     return out
 
 def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], Optional[Dict[str, Any]]]:
+    """
+    Retourne (entities, feed_json_normalisé_ou_None).
+    - Si JSON : normalise camelCase→snake_case puis parse.
+    - Si PB : parse protobuf et retourne (ents, None).
+    """
     fmt = _detect_tripmods_format_bytes(file_bytes)
     if fmt == 'json':
-        feed = json.loads(file_bytes.decode('utf-8'))
+        raw = json.loads(file_bytes.decode('utf-8'))
+        feed = _normalize_json_keys(raw)  # <-- PATCH camelCase->snake_case
         ents = parse_tripmods_json(feed)
         return ents, feed
     else:
         ents = parse_tripmods_protobuf(file_bytes)
         return ents, None
 
-# ----------------------------------------------------------------------------- #
-# 3) Construction des ensembles cibles depuis TripMods
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
+# 4) Ensembles cibles (pour filtrer le GTFS)
+# -----------------------------------------------------------------------------
 def compute_needed_sets(ents: List[TripModEntity]) -> Tuple[Set[str], Set[str]]:
     needed_trip_ids: Set[str] = set()
     needed_stop_ids: Set[str] = set()
     for e in ents:
         for s in e.selected_trips:
-            for tid in s.trip_ids:
-                if tid:
-                    needed_trip_ids.add(str(tid))
+            needed_trip_ids.update([str(tid) for tid in s.trip_ids if tid])
         for m in e.modifications:
             for rs in m.replacement_stops:
                 if rs.stop_id:
                     needed_stop_ids.add(str(rs.stop_id))
-            # selectors peuvent contenir un stop_id (à vérifier dans GTFS stops)
+            # les selectors peuvent porter un stop_id
             for sel in (m.start_stop_selector, m.end_stop_selector):
                 if sel and sel.stop_id:
                     needed_stop_ids.add(str(sel.stop_id))
     return needed_trip_ids, needed_stop_ids
 
-# ----------------------------------------------------------------------------- #
-# 4) Chargement GTFS FILTRÉ (mémoire réduite)
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
+# 5) Chargement GTFS FILTRÉ
+# -----------------------------------------------------------------------------
 def load_gtfs_zip_filtered_bytes(
     zip_bytes: bytes,
     needed_trip_ids: Set[str],
@@ -245,21 +280,19 @@ def load_gtfs_zip_filtered_bytes(
     stop_times: Dict[str, List[Dict[str, str]]] = {}
     stops_present: Set[str] = set()
 
-    # Rien à faire si rien n'est demandé
     if not needed_trip_ids and not needed_stop_ids:
         return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present)
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-        # trips.txt — on ne conserve que les trips demandés (présence)
+        # trips.txt
         if 'trips.txt' in zf.namelist() and needed_trip_ids:
             with zf.open('trips.txt') as f:
                 for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
                     tid = (row.get('trip_id') or '').strip()
                     if tid in needed_trip_ids:
-                        # On stocke la ligne brute (au cas où d'autres colonnes servent plus tard)
                         trips[tid] = {k: (v or "").strip() for k, v in row.items()}
 
-        # stop_times.txt — uniquement les lignes des trips demandés
+        # stop_times.txt
         if 'stop_times.txt' in zf.namelist() and needed_trip_ids:
             with zf.open('stop_times.txt') as f:
                 reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline=''))
@@ -267,17 +300,15 @@ def load_gtfs_zip_filtered_bytes(
                     tid = (r.get('trip_id') or '').strip()
                     if tid in needed_trip_ids:
                         rec = {k: (v or "").strip() for k, v in r.items()}
-                        # Normalise stop_sequence -> int triable
                         try:
                             rec['stop_sequence'] = str(int(rec.get('stop_sequence', '').strip()))
                         except Exception:
                             rec['stop_sequence'] = ''
                         stop_times.setdefault(tid, []).append(rec)
-            # tri par stop_sequence
             for tid, lst in stop_times.items():
                 lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
 
-        # stops.txt — uniquement les stops demandés (présence)
+        # stops.txt
         if 'stops.txt' in zf.namelist() and needed_stop_ids:
             with zf.open('stops.txt') as f:
                 for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
@@ -287,9 +318,9 @@ def load_gtfs_zip_filtered_bytes(
 
     return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present)
 
-# ----------------------------------------------------------------------------- #
-# 5) Analyse
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
+# 6) Analyse
+# -----------------------------------------------------------------------------
 def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]]) -> Optional[int]:
     if sel is None:
         return None
@@ -321,7 +352,6 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                 start_ok = end_ok = False
                 start_seq = end_seq = None
                 notes: List[str] = []
-
                 if not exists:
                     notes.append("trip_id absent du GTFS (filtré ou inexistant)")
                     totals["missing_trip_ids"] += 1
@@ -334,7 +364,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                         if end_seq is None and eseq is not None:
                             end_seq = eseq
                         if sseq is None or eseq is None:
-                            notes.append("start/end selector non résolu sur ce trip (données GTFS filtrées insuffisantes ?)")
+                            notes.append("start/end selector non résolu sur ce trip (données filtrées insuffisantes ?)")
                             totals["invalid_selectors"] += 1
                         else:
                             start_ok = True
@@ -346,7 +376,6 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                     start_seq=start_seq, end_seq=end_seq, notes=notes
                 ))
 
-        # replacement_stops inconnus (dans stops.txt filtré)
         for m in e.modifications:
             for rs in m.replacement_stops:
                 sid = rs.stop_id
@@ -367,12 +396,12 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
 
     return reports, totals
 
-# ----------------------------------------------------------------------------- #
-# 6) UI Streamlit
-# ----------------------------------------------------------------------------- #
-st.set_page_config(page_title="Analyse TripModifications + GTFS", layout="wide")
-st.title("Analyse TripModifications (JSON/PB) vs GTFS — Mode mémoire réduite")
-st.caption("Charge un GTFS (.zip) et un TripModifications (.json/.pb). L’app ne charge du GTFS que ce qui est utilisé par TripModifications (trips/stops ciblés).")
+# -----------------------------------------------------------------------------
+# 7) UI Streamlit
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="Analyse TripModifications + GTFS — Mémoire réduite", layout="wide")
+st.title("Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite")
+st.caption("L’app charge TripModifications d’abord, normalise camelCase → snake_case, puis filtre le GTFS pour ne garder que les trips/stops utilisés.")
 
 with st.sidebar:
     st.header("Données d’entrée")
@@ -386,10 +415,10 @@ if run_btn:
         st.error("Merci de sélectionner **TripModifications** (.json/.pb) **et** **GTFS** (.zip).")
         st.stop()
 
-    # 1) TripMods en premier -> ensembles cibles
+    # 1) TripMods -> normalisation + ensembles cibles
     with st.spinner("Parsing TripModifications…"):
         try:
-            ents, raw_json_feed = load_tripmods_bytes(tripmods_file.getvalue())
+            ents, feed_json = load_tripmods_bytes(tripmods_file.getvalue())
         except Exception as ex:
             st.exception(ex)
             st.stop()
@@ -397,7 +426,7 @@ if run_btn:
     needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
     st.info(f"Filtrage GTFS → trips requis: {len(needed_trip_ids):,} · stops requis: {len(needed_stop_ids):,}")
 
-    # 2) GTFS filtré (uniquement les éléments utiles)
+    # 2) GTFS filtré
     with st.spinner("Chargement GTFS (filtré)…"):
         try:
             gtfs = load_gtfs_zip_filtered_bytes(
@@ -417,9 +446,9 @@ if run_btn:
     if dump_first and ents:
         with st.expander("Aperçu du 1er trip_mod (normalisé)"):
             st.json(asdict(ents[0]))
-    if raw_json_feed is not None:
-        with st.expander("Aperçu brut du feed JSON (optionnel)"):
-            st.json(raw_json_feed)
+    if feed_json is not None:
+        with st.expander("Aperçu brut du feed JSON (après normalisation camel→snake)"):
+            st.json(feed_json)
 
     # 3) Analyse
     with st.spinner("Analyse en cours…"):
@@ -470,6 +499,7 @@ if run_btn:
         file_name="rapport_tripmods.json",
         mime="application/json"
     )
+
 else:
-    st.info("Charge un TripModifications (.json/.pb), puis un GTFS (.zip), et clique **Analyser**.")
-    st.caption("Chargement mémoire réduite : seules les lignes du GTFS utilisées par TripModifications sont lues.")
+    st.info("Charge un TripModifications (.json/.pb) puis un GTFS (.zip), et clique **Analyser**.")
+    st.caption("Le JSON est normalisé (camelCase → snake_case). Le GTFS est filtré sur les trips/stops réellement utilisés.")
