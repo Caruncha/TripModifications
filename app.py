@@ -545,7 +545,7 @@ with st.expander("🧪 Laboratoire polyline (tester une chaîne à part)"):
         if pts:
             chart = build_chart_for_polyline(pts, shape_id="(test)")
             if chart is not None:
-                st.altair_chart(chart, width="stretch")
+                st.altair_chart(chart, use_container_width=True)
             st.dataframe(pd.DataFrame(pts, columns=["lat", "lon"]).head(20), width="stretch")
 
 if run_btn:
