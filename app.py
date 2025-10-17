@@ -679,7 +679,8 @@ if run_btn:
                 poly = rt_shapes.shapes.get(shape_id_for_plot, [])
                 chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot)
                 if chart is not None:
-                    st.altair_chart(chart, width="stretch")
+                    # APRÈS (compatible)
+                    st.altair_chart(chart, use_container_width=True)
                 else:
                     st.info("Polyline vide ou invalide pour cette entité.")
             else:
