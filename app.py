@@ -868,72 +868,101 @@ if run_btn:
             shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
             st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
 
-            # Détails par trip (anomalies incluses)
-            detail_rows = []
-            for t in r.trips:
-                st_list = gtfs.stop_times.get(t.trip_id, [])
-                stop_times_count = len(st_list)
+# --- Détails + tracé par entité (filtré sur les vraies entités TripModifications) ---
+st.subheader("Détails")
+for r in reports[:200]:
+    # On récupère l'entité "source" (issue du parseur trip_modifications)
+    ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
 
-                # shape_id associé à CE trip (dans le contexte entité)
-                trip_shape_id = None
-                if ent_obj:
-                    for s in ent_obj.selected_trips:
-                        if t.trip_id in s.trip_ids and s.shape_id:
-                            trip_shape_id = s.shape_id
-                            break
-                if not trip_shape_id and shape_ids_in_entity:
-                    trip_shape_id = shape_ids_in_entity[0]
+    # ✅ Filtre : on affiche les détails UNIQUEMENT si l'entité contient un trip_modifications
+    if not ent_obj or not ent_obj.modifications:
+        continue
 
-                poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
-                poly_points = len(poly)
+    with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
+        st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
 
-                def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
-                    if not coords or len(coords) < 2: return True
-                    lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
-                    return (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4
+        # Liste des shape_id déclarés côté selected_trips (utile pour le tracé)
+        shape_ids_in_entity = []
+        for s in ent_obj.selected_trips:
+            if s.shape_id:
+                shape_ids_in_entity.append(s.shape_id)
+        shape_ids_set = set(shape_ids_in_entity)
+        mixed_shapes = len([sid for sid in shape_ids_set if sid]) > 1
 
-                poly_anormal = _is_poly_anormal(poly)
-                selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
-                ordre_ok = ""
-                ecart_seq = ""
-                if (t.start_seq is not None) and (t.end_seq is not None):
-                    ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
-                    ecart_seq = t.end_seq - t.start_seq
-                duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
+        # Comptage des trips dupliqués dans l'entité
+        trip_counts: Dict[str, int] = {}
+        for s in ent_obj.selected_trips:
+            for tid in s.trip_ids:
+                trip_counts[tid] = trip_counts.get(tid, 0) + 1
 
-                detail_rows.append({
-                    "trip_id": t.trip_id,
-                    "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
-                    "start_seq": t.start_seq if t.start_seq is not None else "",
-                    "end_seq": t.end_seq if t.end_seq is not None else "",
-                    "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
-                    "notes": "; ".join(t.notes) if t.notes else "",
-                    # Anomalies / diagnostics
-                    "shape_id (trip)": trip_shape_id or "",
-                    "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
-                    "pts polyline": poly_points,
-                    "polyline anormale": "oui" if poly_anormal else "non",
-                    "stop_times (nb)": stop_times_count,
-                    "ordre start<=end": ordre_ok,
-                    "écart seq": ecart_seq,
-                    "selectors incomplets": "oui" if selectors_incomplets else "non",
-                    "trip en double (entité)": "oui" if duplicate_trip else "non",
-                    "mixed shapes (entité)": "oui" if mixed_shapes else "non",
-                    "repl_stops inconnus (entité)": len(r.replacement_stops_unknown_in_gtfs)
-                })
+        # Shape utilisé pour le tracé : premier shape_id disponible dans rt_shapes
+        shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
+        st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
 
-            st.dataframe(detail_rows, width="stretch", height=260)
+        # Tableau Détails (diagnostics)
+        detail_rows = []
+        for t in r.trips:
+            st_list = gtfs.stop_times.get(t.trip_id, [])
+            stop_times_count = len(st_list)
 
-            # Tracé (si shape dispo)
-            if shape_id_for_plot:
-                poly = rt_shapes.shapes.get(shape_id_for_plot, [])
-                chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot, show_index_labels=False)
-                if chart is not None:
-                    st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.info("Polyline vide ou invalide pour cette entité.")
+            # shape_id associé à CE trip (dans le contexte entité)
+            trip_shape_id = None
+            for s in ent_obj.selected_trips:
+                if t.trip_id in s.trip_ids and s.shape_id:
+                    trip_shape_id = s.shape_id
+                    break
+            if not trip_shape_id and shape_ids_in_entity:
+                trip_shape_id = shape_ids_in_entity[0]
+
+            poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
+            poly_points = len(poly)
+
+            def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
+                if not coords or len(coords) < 2: return True
+                lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
+                return (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4
+
+            poly_anormal = _is_poly_anormal(poly)
+            selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
+            ordre_ok = ""
+            ecart_seq = ""
+            if (t.start_seq is not None) and (t.end_seq is not None):
+                ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
+                ecart_seq = t.end_seq - t.start_seq
+            duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
+
+            detail_rows.append({
+                "trip_id": t.trip_id,
+                "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
+                "start_seq": t.start_seq if t.start_seq is not None else "",
+                "end_seq": t.end_seq if t.end_seq is not None else "",
+                "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
+                "notes": "; ".join(t.notes) if t.notes else "",
+                # Anomalies / diagnostics
+                "shape_id (trip)": trip_shape_id or "",
+                "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
+                "pts polyline": poly_points,
+                "polyline anormale": "oui" if poly_anormal else "non",
+                "stop_times (nb)": stop_times_count,
+                "ordre start<=end": ordre_ok,
+                "écart seq": ecart_seq,
+                "selectors incomplets": "oui" if selectors_incomplets else "non",
+                "trip en double (entité)": "oui" if duplicate_trip else "non",
+                "mixed shapes (entité)": "oui" if mixed_shapes else "non",
+            })
+
+        st.dataframe(detail_rows, width="stretch", height=260)
+
+        # Tracé (si shape dispo)
+        if shape_id_for_plot:
+            poly = rt_shapes.shapes.get(shape_id_for_plot, [])
+            chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot, show_index_labels=False)
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True)
             else:
-                st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
+                st.info("Polyline vide ou invalide pour cette entité.")
+        else:
+            st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
 
     # Export JSON
     report_json = {"totals": totals, "total_shapes": total_shapes, "entities": [asdict(r) for r in reports]}
