@@ -1,35 +1,24 @@
-# app.py — Analyse TripModifications (JSON/PB) vs GTFS + visualisation Altair
-# -----------------------------------------------------------------------------
-# Version : polyline seule (shape GTFS) + arrêts de remplacement (temporaires)
-# - AUCUN fond de carte
-# - AUCUN tronçon (pas de surlignage start/end)
-# - Cadrage automatique sur la polyline : domaines X/Y = min/max(lon/lat) + padding
-# - zero=False et nice=False pour éviter l’écrasement de la latitude
-# -----------------------------------------------------------------------------
-
 from __future__ import annotations
 import streamlit as st
-import json, csv, io, zipfile, sys, math
+import json, csv, io, zipfile, sys
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple
 from pathlib import Path
-import pandas as pd
-import altair as alt
 
-# -----------------------------------------------------------------------------
-# 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# 0) Import des bindings protobuf locaux
+# ----------------------------------------------------------------------------- #
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 try:
-    import gtfs_realtime_pb2 as gtfs_local  # votre fichier local
+    import gtfs_realtime_pb2 as gtfs_local
 except Exception:
-    gtfs_local = None  # fallback vers les bindings pip si possible
+    gtfs_local = None
 
-# -----------------------------------------------------------------------------
-# 1) Modèle en mémoire normalisé
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# 1) Modèles
+# ----------------------------------------------------------------------------- #
 @dataclass
 class StopSelector:
     stop_sequence: Optional[int] = None
@@ -60,9 +49,34 @@ class TripModEntity:
     start_times: List[str] = field(default_factory=list)
     modifications: List[Modification] = field(default_factory=list)
 
-# -----------------------------------------------------------------------------
-# 2) Utilitaires parsing + normalisation
-# -----------------------------------------------------------------------------
+@dataclass
+class GtfsStatic:
+    trips: Dict[str, Dict[str, str]]
+    stop_times: Dict[str, List[Dict[str, str]]]
+    stops: Dict[str, Dict[str, str]]
+
+@dataclass
+class TripCheck:
+    trip_id: str
+    exists_in_gtfs: bool
+    start_seq_valid: bool
+    end_seq_valid: bool
+    start_seq: Optional[int] = None
+    end_seq: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+@dataclass
+class EntityReport:
+    entity_id: str
+    total_selected_trip_ids: int
+    service_dates: List[str]
+    modification_count: int
+    trips: List[TripCheck]
+    replacement_stops_unknown_in_gtfs: List[str] = field(default_factory=list)
+
+# ----------------------------------------------------------------------------- #
+# 2) Parsing TripModifications
+# ----------------------------------------------------------------------------- #
 def _detect_tripmods_format_bytes(b: bytes) -> str:
     head = (b[:2] or b'').lstrip()
     return 'json' if head.startswith(b'{') or head.startswith(b'[') else 'pb'
@@ -100,9 +114,6 @@ def _coerce_selected_trips(obj: Dict[str, Any]) -> SelectedTrips:
     shape_id = str(shape_id) if shape_id not in (None, '') else None
     return SelectedTrips(trip_ids=trips, shape_id=shape_id)
 
-# -----------------------------------------------------------------------------
-# 3) Parsing TripModifications JSON / PB
-# -----------------------------------------------------------------------------
 def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
     entities = feed.get('entity') or []
     out: List[TripModEntity] = []
@@ -138,7 +149,7 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
         out.append(TripModEntity(
             entity_id=str(e.get('id')),
             selected_trips=selected,
-            service_dates=[str(d) for d in service_dates],
+            service_dates=service_dates,
             start_times=start_times,
             modifications=mods
         ))
@@ -147,14 +158,7 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
 def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
     proto = gtfs_local
     if proto is None:
-        try:
-            from google.transit import gtfs_realtime_pb2 as proto
-        except Exception as ex:
-            raise RuntimeError(
-                "Bindings Protobuf introuvables. "
-                "Assure-toi d’avoir `gtfs_realtime_pb2.py` à la racine "
-                "ou installe `gtfs-realtime-bindings` compatibles TripModifications."
-            ) from ex
+        from google.transit import gtfs_realtime_pb2 as proto
     feed = proto.FeedMessage()
     feed.ParseFromString(data)
     out: List[TripModEntity] = []
@@ -197,109 +201,19 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         ))
     return out
 
-# -----------------------------------------------------------------------------
-# 4) Shapes & stops RT (depuis le feed TripMods) + décodage polyline
-# -----------------------------------------------------------------------------
-@dataclass
-class RtShapesAndStops:
-    shapes: Dict[str, List[Tuple[float, float]]]  # shape_id -> [(lat, lon), ...]
-    rt_stops: Dict[str, Tuple[float, float]]      # stop_id -> (lat, lon)
-
-def decode_polyline(encoded: str) -> List[Tuple[float, float]]:
-    """Retourne une liste [(lat, lon), ...] à partir d'une polyline encodée Google."""
-    coords = []
-    index, lat, lon = 0, 0, 0
-    while index < len(encoded):
-        result, shift = 0, 0
-        while True:
-            b = ord(encoded[index]) - 63; index += 1
-            result = (b & 0x1f) << shift; shift += 5
-            if b < 0x20: break
-        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
-        lat += dlat
-        result, shift = 0, 0
-        while True:
-            b = ord(encoded[index]) - 63; index += 1
-            result = (b & 0x1f) << shift; shift += 5
-            if b < 0x20: break
-        dlon = ~(result >> 1) if (result & 1) else (result >> 1)
-        lon += dlon
-        coords.append((lat / 1e5, lon / 1e5))
-    return coords
-
-def _collect_shapes_stops_json(feed: Dict[str, Any]) -> RtShapesAndStops:
-    shapes, rt_stops = {}, {}
-    for e in feed.get('entity', []):
-        if e.get('shape'):
-            sh = e['shape']
-            sid = str(sh.get('shape_id') or '')
-            enc = sh.get('encoded_polyline')
-            if sid and enc:
-                try:
-                    shapes[sid] = decode_polyline(enc)
-                except Exception:
-                    pass
-        if e.get('stop'):
-            stp = e['stop']
-            sid = str(stp.get('stop_id') or '')
-            lat = stp.get('stop_lat'); lon = stp.get('stop_lon')
-            try:
-                if sid and lat is not None and lon is not None:
-                    rt_stops[sid] = (float(lat), float(lon))
-            except Exception:
-                pass
-    return RtShapesAndStops(shapes=shapes, rt_stops=rt_stops)
-
-def _collect_shapes_stops_pb(data: bytes) -> RtShapesAndStops:
-    shapes, rt_stops = {}, {}
-    proto = gtfs_local
-    if proto is None:
-        try:
-            from google.transit import gtfs_realtime_pb2 as proto
-        except Exception:
-            return RtShapesAndStops(shapes, rt_stops)
-    feed = proto.FeedMessage(); feed.ParseFromString(data)
-    for ent in feed.entity:
-        if hasattr(ent, 'shape') and ent.shape and getattr(ent.shape, 'encoded_polyline', None):
-            sid = str(getattr(ent.shape, 'shape_id', '') or '')
-            enc = ent.shape.encoded_polyline
-            if sid and enc:
-                try:
-                    shapes[sid] = decode_polyline(enc)
-                except Exception:
-                    pass
-        if hasattr(ent, 'stop') and ent.stop:
-            sid = str(getattr(ent.stop, 'stop_id', '') or '')
-            lat = getattr(ent.stop, 'stop_lat', None)
-            lon = getattr(ent.stop, 'stop_lon', None)
-            try:
-                if sid and lat is not None and lon is not None:
-                    rt_stops[sid] = (float(lat), float(lon))
-            except Exception:
-                pass
-    return RtShapesAndStops(shapes=shapes, rt_stops=rt_stops)
-
-def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], RtShapesAndStops, Optional[Dict[str, Any]]]:
+def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], Optional[Dict[str, Any]]]:
     fmt = _detect_tripmods_format_bytes(file_bytes)
     if fmt == 'json':
         feed = json.loads(file_bytes.decode('utf-8'))
         ents = parse_tripmods_json(feed)
-        rt = _collect_shapes_stops_json(feed)
-        return ents, rt, feed
+        return ents, feed
     else:
         ents = parse_tripmods_protobuf(file_bytes)
-        rt = _collect_shapes_stops_pb(file_bytes)
-        return ents, rt, None
+        return ents, None
 
-# -----------------------------------------------------------------------------
-# 5) Chargement GTFS (zip) + index
-# -----------------------------------------------------------------------------
-@dataclass
-class GtfsStatic:
-    trips: Dict[str, Dict[str, str]]
-    stop_times: Dict[str, List[Dict[str, str]]]
-    stops: Dict[str, Dict[str, str]]
-
+# ----------------------------------------------------------------------------- #
+# 3) Chargement GTFS
+# ----------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False)
 def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
     trips: Dict[str, Dict[str, str]] = {}
@@ -338,28 +252,9 @@ def load_gtfs_zip_bytes(zip_bytes: bytes) -> GtfsStatic:
                         stops[row['stop_id']] = row
     return GtfsStatic(trips=trips, stop_times=stop_times, stops=stops)
 
-# -----------------------------------------------------------------------------
-# 6) Analyse TripMods vs GTFS
-# -----------------------------------------------------------------------------
-@dataclass
-class TripCheck:
-    trip_id: str
-    exists_in_gtfs: bool
-    start_seq_valid: bool
-    end_seq_valid: bool
-    start_seq: Optional[int] = None
-    end_seq: Optional[int] = None
-    notes: List[str] = field(default_factory=list)
-
-@dataclass
-class EntityReport:
-    entity_id: str
-    total_selected_trip_ids: int
-    service_dates: List[str]
-    modification_count: int
-    trips: List[TripCheck]
-    replacement_stops_unknown_in_gtfs: List[str] = field(default_factory=list)
-
+# ----------------------------------------------------------------------------- #
+# 4) Analyse
+# ----------------------------------------------------------------------------- #
 def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]]) -> Optional[int]:
     if sel is None:
         return None
@@ -427,103 +322,12 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
         ))
     return reports, totals
 
-# -----------------------------------------------------------------------------
-# 7) Altair — polyline seule + arrêts temporaires ; cadrage auto min/max
-# -----------------------------------------------------------------------------
-def _build_altair_chart_polyline_only(
-    ent: TripModEntity,
-    rt: RtShapesAndStops,
-    gtfs: GtfsStatic
-) -> Optional[alt.Chart]:
-    # 1) shape_id (on prend le premier selected_trips avec shape_id exploitable)
-    shape_id = None
-    for s in ent.selected_trips:
-        if s.shape_id and s.shape_id in rt.shapes:
-            shape_id = s.shape_id
-            break
-    if not shape_id:
-        return None
-
-    poly = rt.shapes[shape_id]  # [(lat, lon), ...]
-    if len(poly) < 2:
-        return None
-
-    # 2) DataFrame polyline
-    df_route = pd.DataFrame([{"lat": la, "lon": lo} for la, lo in poly])
-
-    # 3) Cadrage automatique — domaine X/Y = min/max lon/lat de la polyline (padding léger)
-    lats = [la for la, _ in poly]
-    lons = [lo for _, lo in poly]
-    lat_min, lat_max = min(lats), max(lats)
-    lon_min, lon_max = min(lons), max(lons)
-
-    def _pad(minv, maxv, frac=0.03, floor=1e-4):
-        span = max(maxv - minv, floor)
-        pad = max(span * frac, floor)
-        return (minv - pad, maxv + pad)
-
-    lon_min, lon_max = _pad(lon_min, lon_max)
-    lat_min, lat_max = _pad(lat_min, lat_max)
-
-    x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
-    y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
-
-    # 4) Arrêts de remplacement (temporaires) — on agrège tous les mods
-    markers: List[Dict[str, Any]] = []
-    order = 1
-    for m in ent.modifications:
-        for rs in m.replacement_stops:
-            sid = rs.stop_id
-            la_lo = None
-            if sid in gtfs.stops:
-                r = gtfs.stops[sid]
-                try:
-                    la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
-                except Exception:
-                    la_lo = None
-            if not la_lo and sid in rt.rt_stops:
-                la_lo = rt.rt_stops[sid]
-            if la_lo:
-                markers.append({"lat": la_lo[0], "lon": la_lo[1], "type": "repl", "label": f"{order}·{sid}"})
-                order += 1
-
-    # 5) Construction des calques : polyline + (optionnel) marqueurs temporaires
-    layers = []
-
-    base = alt.Chart(df_route).mark_line(color="#1f77b4", strokeWidth=3).encode(
-        x=alt.X("lon:Q", title="Longitude", scale=x_scale),
-        y=alt.Y("lat:Q", title="Latitude",  scale=y_scale)
-    )
-    layers.append(base)
-
-    if markers:
-        dfm = pd.DataFrame(markers)
-        # Points
-        layers.append(
-            alt.Chart(dfm).mark_point(size=90, filled=True, color="#f9ab00").encode(
-                x=alt.X("lon:Q", scale=x_scale),
-                y=alt.Y("lat:Q", scale=y_scale),
-                tooltip=["label:N"]
-            )
-        )
-        # Labels
-        layers.append(
-            alt.Chart(dfm).mark_text(dy=-10, color="#202124").encode(
-                x=alt.X("lon:Q", scale=x_scale),
-                y=alt.Y("lat:Q", scale=y_scale),
-                text="label:N"
-            )
-        )
-
-    chart = alt.layer(*layers).properties(width="container", height=380).interactive()
-    return chart
-
-# -----------------------------------------------------------------------------
-# 8) UI Streamlit
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# 5) UI Streamlit
+# ----------------------------------------------------------------------------- #
 st.set_page_config(page_title="Analyse TripModifications + GTFS", layout="wide")
 st.title("Analyse TripModifications (JSON/PB) vs GTFS")
-st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json/.pb), puis lance l’analyse. Visualisation Altair : polyline + arrêts temporaires (si disponibles).")
+st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json/.pb), puis lance l’analyse.")
 
 with st.sidebar:
     st.header("Données d’entrée")
@@ -541,7 +345,7 @@ if run_btn:
         gtfs = load_gtfs_zip_bytes(gtfs_file.getvalue())
     with st.spinner("Parsing TripModifications…"):
         try:
-            ents, rt, raw_json_feed = load_tripmods_bytes(tripmods_file.getvalue())
+            ents, raw_json_feed = load_tripmods_bytes(tripmods_file.getvalue())
         except Exception as ex:
             st.exception(ex)
             st.stop()
@@ -581,15 +385,13 @@ if run_btn:
     st.subheader("Synthèse par entité")
     st.dataframe(table, use_container_width=True, height=360)
 
-    # Détails par entité (polyline + arrêts temporaires)
+    # Détails par entité
     st.subheader("Détails")
-    for r in reports[:200]:  # limite d'affichage
+    for r in reports[:200]:
         with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
             st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
             st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
                      ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
-
-            # Tableau par trip
             detail_rows = [{
                 "trip_id": t.trip_id,
                 "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
@@ -600,26 +402,4 @@ if run_btn:
             } for t in r.trips]
             st.dataframe(detail_rows, use_container_width=True, height=240)
 
-            # Visualisation Altair : polyline seule + arrêts temporaires
-            ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
-            if ent_obj:
-                chart = _build_altair_chart_polyline_only(ent_obj, rt, gtfs)
-                if chart is not None:
-                    st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.info("Pas de shape exploitable pour visualiser cette entité.")
-
-    # Export du rapport brut
-    report_json = {
-        "totals": totals,
-        "entities": [asdict(r) for r in reports]
-    }
-    st.download_button(
-        "📥 Télécharger le rapport JSON",
-        data=json.dumps(report_json, ensure_ascii=False, indent=2),
-        file_name="rapport_tripmods.json",
-        mime="application/json"
-    )
-else:
-    st.info("Charge un GTFS (.zip) et un TripModifications (.json/.pb), puis clique **Analyser**.")
-    st.caption("Affichage : polyline (shape GTFS) + arrêts de remplacement si disponibles, avec cadrage automatique.")
+    # Export du rapport
