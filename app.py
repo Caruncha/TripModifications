@@ -1,5 +1,11 @@
-# app.py — Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite + polyline fiable
-# Remplacements : use_container_width -> width='stretch' ; déséchappage sans unicode_escape
+# app.py — Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite + polyline + points
+# -----------------------------------------------------------------------------------------------
+# - Normalise camelCase → snake_case (JSON)
+# - GTFS filtré (ne charge que trips/stop_times/stops utiles)
+# - Encoded polyline : nettoyage + décodage (Auto/1e-5/1e-6) + tracé à l’échelle
+# - 🔴 Points rouges sur chaque sommet du tracé
+# - Détails enrichis (anomalies) + Laboratoire polyline
+# -----------------------------------------------------------------------------------------------
 
 from __future__ import annotations
 import streamlit as st
@@ -107,20 +113,17 @@ class RtShapes:
 # -----------------------------------------------------------------------------------------------
 def _sanitize_polyline(s: str) -> str:
     """
-    Nettoyage minimal conforme aux recommandations Google :
-    - retire espaces/retours (si collé depuis JSON)
+    Nettoyage minimal :
+    - retire espaces/retours
     - remplace \\n, \\r, \\t par vide
-    - remplace \\\\ par \\  (déséchappage 'backslash' simple)
-    Réf. : l’outil Google demande d’« unescape » les polylignes JSON. 
+    - remplace \\\\ par \\ (déséchappage simple)
     """
     if not s:
         return s
     s = s.strip()
-    # nettoyer séquences JSON fréquentes
     if "\\n" in s or "\\r" in s or "\\t" in s or "\\\\" in s:
         s = s.replace("\\n", "").replace("\\r", "").replace("\\t", "")
         s = s.replace("\\\\", "\\")
-    # supprimer espaces/blancs résiduels
     s = re.sub(r"\s+", "", s)
     return s
 
@@ -171,20 +174,14 @@ def decode_polyline(encoded: str, mode: str = "auto") -> List[Tuple[float, float
         except Exception:
             return _legacy_decode_polyline(enc)
     # auto
-    try:
-        c5 = pl.decode(enc, precision=5)
-    except Exception:
-        c5 = []
-    try:
-        c6 = pl.decode(enc, precision=6)
-    except Exception:
-        c6 = []
-    if _valid_coords(c5) and not _valid_coords(c6):
-        return c5
-    if _valid_coords(c6) and not _valid_coords(c5):
-        return c6
+    try: c5 = pl.decode(enc, precision=5)
+    except Exception: c5 = []
+    try: c6 = pl.decode(enc, precision=6)
+    except Exception: c6 = []
+    if _valid_coords(c5) and not _valid_coords(c6): return c5
+    if _valid_coords(c6) and not _valid_coords(c5): return c6
     if _valid_coords(c5) and _valid_coords(c6):
-        def span(cs): 
+        def span(cs):
             lats = [la for la,_ in cs]; lons = [lo for _,lo in cs]
             return (max(lats)-min(lats)) + (max(lons)-min(lons))
         return c6 if span(c6) > span(c5)*1.3 else c5
@@ -484,7 +481,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
     return reports, totals
 
 # -----------------------------------------------------------------------------------------------
-# 8) Visualisation (Altair)
+# 8) Visualisation (Altair) — ligne + points rouges
 # -----------------------------------------------------------------------------------------------
 def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor: float = 1e-4):
     if not coords:
@@ -501,30 +498,42 @@ def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor
 def build_chart_for_polyline(poly: List[Tuple[float, float]], shape_id: Optional[str] = None):
     if not poly or len(poly) < 2:
         return None
-    df_route = pd.DataFrame([{"lat": la, "lon": lo} for la, lo in poly])
+    df_route = pd.DataFrame([{"lat": la, "lon": lo, "idx": i} for i, (la, lo) in enumerate(poly)])
     (lon_min, lon_max), (lat_min, lat_max) = _compute_domain(poly)
     x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
     y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
     title = f"Tracé (encoded_polyline){' — ' + shape_id if shape_id else ''}"
-    chart = (
-        alt.Chart(df_route, title=title)
+
+    # couche ligne
+    line = (
+        alt.Chart(df_route)
            .mark_line(color="#1f77b4", strokeWidth=3)
            .encode(
                x=alt.X("lon:Q", title="Longitude", scale=x_scale),
                y=alt.Y("lat:Q", title="Latitude", scale=y_scale)
            )
-           .properties(width="container", height=360)  # largeur gérée par st.altair_chart(..., width=...)
-           .interactive()
     )
+
+    # couche points rouges
+    points = (
+        alt.Chart(df_route)
+           .mark_circle(color="red", size=40, opacity=0.9)
+           .encode(
+               x=alt.X("lon:Q", scale=x_scale),
+               y=alt.Y("lat:Q", scale=y_scale),
+               tooltip=[alt.Tooltip("idx:Q", title="#"), alt.Tooltip("lat:Q"), alt.Tooltip("lon:Q")]
+           )
+    )
+
+    chart = (line + points).properties(width="container", height=360, title=title).interactive()
     return chart
 
 # -----------------------------------------------------------------------------------------------
 # 9) UI Streamlit
 # -----------------------------------------------------------------------------------------------
-st.set_page_config(page_title="Analyse TripModifications + GTFS — Mémoire réduite + polyline fiable", layout="wide")
+st.set_page_config(page_title="Analyse TripModifications + GTFS — Mémoire réduite + polyline + points", layout="wide")
 st.title("Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite")
-st.caption("Le JSON est normalisé (camelCase → snake_case). Le GTFS est filtré. "
-           "Les polylines sont nettoyées (déséchappage léger) et décodées en Auto/1e-5/1e-6.")
+st.caption("Les polylines sont nettoyées (déséchappage léger), décodées (Auto/1e‑5/1e‑6) et affichées avec des points rouges sur chaque sommet.")
 
 with st.sidebar:
     st.header("Données d’entrée")
@@ -622,7 +631,6 @@ if run_btn:
                 for s in ent_obj.selected_trips:
                     for tid in s.trip_ids:
                         trip_counts[tid] = trip_counts.get(tid, 0) + 1
-
             detail_rows = []
             for t in r.trips:
                 st_list = gtfs.stop_times.get(t.trip_id, [])
@@ -679,7 +687,6 @@ if run_btn:
                 poly = rt_shapes.shapes.get(shape_id_for_plot, [])
                 chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot)
                 if chart is not None:
-                    # APRÈS (compatible)
                     st.altair_chart(chart, use_container_width=True)
                 else:
                     st.info("Polyline vide ou invalide pour cette entité.")
