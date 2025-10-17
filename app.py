@@ -1,18 +1,10 @@
 # app.py — Analyse TripModifications (JSON/PB) vs GTFS + visualisation Altair
 # -----------------------------------------------------------------------------
-# Nouveautés :
-# - Fond cartographique vectoriel (mark_geoshape) avec projection 'mercator'.
-# - Zoom automatique par détour via projection.fit sur le BBOX du tracé (segment
-#   start/end si disponible, sinon shape complète). => Cadrage Montréal & alentours.
-# - Option UI pour activer/désactiver le fond carto (activé par défaut).
-# - Mode "sans basemap" conservé : axes x/y numériques avec domain contrôlé
-#   (zero=False) pour éviter l’écrasement vertical des latitudes.
-#
-# Références :
-# - Vega-Lite Projection (type, fit, center, etc.) :
-#   https://vega.github.io/vega-lite/docs/projection.html
-# - Geoshape (fond carto TopoJSON/GeoJSON) :
-#   https://vega.github.io/vega-lite/docs/geoshape.html
+# Version : polyline seule (shape GTFS) + arrêts de remplacement (temporaires)
+# - AUCUN fond de carte
+# - AUCUN tronçon (pas de surlignage start/end)
+# - Cadrage automatique sur la polyline : domaines X/Y = min/max(lon/lat) + padding
+# - zero=False et nice=False pour éviter l’écrasement de la latitude
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,12 +15,6 @@ from typing import List, Optional, Any, Dict, Tuple
 from pathlib import Path
 import pandas as pd
 import altair as alt
-
-# Fond carto (Natural Earth) via vega_datasets
-try:
-    from vega_datasets import data as vega_data
-except Exception:
-    vega_data = None  # on gérera un message si manquant
 
 # -----------------------------------------------------------------------------
 # 0) Import des bindings protobuf locaux (gtfs_realtime_pb2.py à la racine)
@@ -152,7 +138,7 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
         out.append(TripModEntity(
             entity_id=str(e.get('id')),
             selected_trips=selected,
-            service_dates=service_dates,
+            service_dates=[str(d) for d in service_dates],
             start_times=start_times,
             modifications=mods
         ))
@@ -442,235 +428,94 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
     return reports, totals
 
 # -----------------------------------------------------------------------------
-# 7) Altair — calques (route, tronçon, marqueurs) + basemap geoshape + FIT
+# 7) Altair — polyline seule + arrêts temporaires ; cadrage auto min/max
 # -----------------------------------------------------------------------------
-def _haversine(lat1, lon1, lat2, lon2):
-    R = 6371000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
-    return 2*R*math.asin(math.sqrt(a))
-
-def _nearest_index_on_polyline(poly: List[Tuple[float, float]], lat: float, lon: float) -> Optional[int]:
-    if not poly:
-        return None
-    dmin, imin = float('inf'), None
-    for i, (la, lo) in enumerate(poly):
-        d = _haversine(lat, lon, la, lo)
-        if d < dmin:
-            dmin, imin = d, i
-    return imin
-
-def _build_altair_layers_for_entity(
+def _build_altair_chart_polyline_only(
     ent: TripModEntity,
     rt: RtShapesAndStops,
-    gtfs: GtfsStatic,
-    fix_scales: bool = True,
-    use_basemap: bool = True,  # basemap geoshape + FIT par défaut
+    gtfs: GtfsStatic
 ) -> Optional[alt.Chart]:
-    # 1) shape_id
+    # 1) shape_id (on prend le premier selected_trips avec shape_id exploitable)
     shape_id = None
     for s in ent.selected_trips:
-        if s.shape_id:
+        if s.shape_id and s.shape_id in rt.shapes:
             shape_id = s.shape_id
             break
-    if not shape_id or shape_id not in rt.shapes:
+    if not shape_id:
         return None
 
     poly = rt.shapes[shape_id]  # [(lat, lon), ...]
     if len(poly) < 2:
         return None
 
-    # 2) tenter de résoudre un tronçon start/end sur un trip GTFS existant
-    trip_id_ref = None
-    for s in ent.selected_trips:
-        for tid in s.trip_ids:
-            if tid in gtfs.trips:
-                trip_id_ref = tid; break
-        if trip_id_ref: break
+    # 2) DataFrame polyline
+    df_route = pd.DataFrame([{"lat": la, "lon": lo} for la, lo in poly])
 
-    df_segment = None
-    df_markers = []
-    segment_coords: Optional[List[Tuple[float, float]]] = None
+    # 3) Cadrage automatique — domaine X/Y = min/max lon/lat de la polyline (padding léger)
+    lats = [la for la, _ in poly]
+    lons = [lo for _, lo in poly]
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
 
-    if trip_id_ref:
-        st_list = gtfs.stop_times.get(trip_id_ref, [])
-        if ent.modifications:
-            m = ent.modifications[0]
+    def _pad(minv, maxv, frac=0.03, floor=1e-4):
+        span = max(maxv - minv, floor)
+        pad = max(span * frac, floor)
+        return (minv - pad, maxv + pad)
 
-            def _coord_from_selector(sel: StopSelector) -> Optional[Tuple[float, float, str]]:
-                if sel is None: return None
-                if sel.stop_id:
-                    if sel.stop_id in gtfs.stops:
-                        r = gtfs.stops[sel.stop_id]
-                        try: return (float(r.get('stop_lat')), float(r.get('stop_lon')), sel.stop_id)
-                        except Exception: pass
-                    if sel.stop_id in rt.rt_stops:
-                        la, lo = rt.rt_stops[sel.stop_id]; return (la, lo, sel.stop_id)
-                if sel.stop_sequence is not None:
-                    for r in st_list:
-                        try:
-                            if int(r.get('stop_sequence') or -999) == sel.stop_sequence:
-                                return (float(r.get('stop_lat')), float(r.get('stop_lon')), r.get('stop_id'))
-                        except Exception:
-                            pass
-                return None
+    lon_min, lon_max = _pad(lon_min, lon_max)
+    lat_min, lat_max = _pad(lat_min, lat_max)
 
-            start_c = _coord_from_selector(m.start_stop_selector)
-            end_c   = _coord_from_selector(m.end_stop_selector)
+    x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
+    y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
 
-            # sous-tracé (segment) entre start/end
-            if start_c and end_c:
-                s_idx = _nearest_index_on_polyline(poly, start_c[0], start_c[1])
-                e_idx = _nearest_index_on_polyline(poly, end_c[0], end_c[1])
-                if s_idx is not None and e_idx is not None and e_idx > s_idx:
-                    sub = poly[s_idx:e_idx+1]
-                    segment_coords = sub
-                    df_segment = pd.DataFrame([{"lat": la, "lon": lo, "seg": "troncon"} for la, lo in sub])
+    # 4) Arrêts de remplacement (temporaires) — on agrège tous les mods
+    markers: List[Dict[str, Any]] = []
+    order = 1
+    for m in ent.modifications:
+        for rs in m.replacement_stops:
+            sid = rs.stop_id
+            la_lo = None
+            if sid in gtfs.stops:
+                r = gtfs.stops[sid]
+                try:
+                    la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
+                except Exception:
+                    la_lo = None
+            if not la_lo and sid in rt.rt_stops:
+                la_lo = rt.rt_stops[sid]
+            if la_lo:
+                markers.append({"lat": la_lo[0], "lon": la_lo[1], "type": "repl", "label": f"{order}·{sid}"})
+                order += 1
 
-                # marqueurs (non utilisés pour cadrer)
-                df_markers.append({"type": "start", "lat": start_c[0], "lon": start_c[1], "label": start_c[2] or "start"})
-                df_markers.append({"type": "end",   "lat": end_c[0],   "lon": end_c[1],   "label": end_c[2] or "end"})
-
-            # arrêts de remplacement
-            order = 1
-            for rs in m.replacement_stops:
-                sid = rs.stop_id
-                la_lo = None
-                if sid in gtfs.stops:
-                    r = gtfs.stops[sid]
-                    try: la_lo = (float(r.get('stop_lat')), float(r.get('stop_lon')))
-                    except Exception: pass
-                if not la_lo and sid in rt.rt_stops:
-                    la_lo = rt.rt_stops[sid]
-                if la_lo:
-                    df_markers.append({"type": "repl", "lat": la_lo[0], "lon": la_lo[1], "label": f"{order}·{sid}"})
-                    order += 1
-
-    # 3) Domaine (pour le mode sans basemap) basé sur le tracé GTFS (segment si dispo)
-    def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor: float = 1e-4):
-        if not coords:
-            return (-180.0, 180.0), (-90.0, 90.0)
-        lats = [la for la, _ in coords]
-        lons = [lo for _, lo in coords]
-        lat_min, lat_max = min(lats), max(lats)
-        lon_min, lon_max = min(lons), max(lons)
-        span_lat = max(lat_max - lat_min, floor)
-        span_lon = max(lon_max - lon_min, floor)
-        pad_lat = max(span_lat * frac, floor)
-        pad_lon = max(span_lon * frac, floor)
-        return (lon_min - pad_lon, lon_max + pad_lon), (lat_min - pad_lat, lat_max + pad_lat)
-
-    coords_for_domain = segment_coords if segment_coords else poly
-    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain(coords_for_domain)
-
-    # 4) DataFrames
-    df_route = pd.DataFrame([{"lat": la, "lon": lo, "seg": "route"} for la, lo in poly])
-
-    # 5) Construction des calques
+    # 5) Construction des calques : polyline + (optionnel) marqueurs temporaires
     layers = []
 
-    if use_basemap:
-        # --- Fond carto vectoriel (geoshape) --------------------------------
-        if vega_data is None:
-            # Sécurité si vega_datasets n'est pas installé
-            st.warning("Le fond carto nécessite 'vega_datasets'. Ajoute-le au requirements.")
-            return None
-        world = alt.topo_feature(vega_data.world_110m.url, 'countries')
-        bg = alt.Chart(world).mark_geoshape(
-            fill="#f5f5f5", stroke="#d9d9d9"
+    base = alt.Chart(df_route).mark_line(color="#1f77b4", strokeWidth=3).encode(
+        x=alt.X("lon:Q", title="Longitude", scale=x_scale),
+        y=alt.Y("lat:Q", title="Latitude",  scale=y_scale)
+    )
+    layers.append(base)
+
+    if markers:
+        dfm = pd.DataFrame(markers)
+        # Points
+        layers.append(
+            alt.Chart(dfm).mark_point(size=90, filled=True, color="#f9ab00").encode(
+                x=alt.X("lon:Q", scale=x_scale),
+                y=alt.Y("lat:Q", scale=y_scale),
+                tooltip=["label:N"]
+            )
         )
-        layers.append(bg)
-
-        # --- Route / tronçon / marqueurs en coordonnées géographiques -------
-        route_geo = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
-            longitude='lon:Q', latitude='lat:Q'
-        )
-        layers.append(route_geo)
-
-        if df_segment is not None and not df_segment.empty:
-            seg_geo = alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
-                longitude='lon:Q', latitude='lat:Q'
+        # Labels
+        layers.append(
+            alt.Chart(dfm).mark_text(dy=-10, color="#202124").encode(
+                x=alt.X("lon:Q", scale=x_scale),
+                y=alt.Y("lat:Q", scale=y_scale),
+                text="label:N"
             )
-            layers.append(seg_geo)
-
-        if df_markers:
-            dfm = pd.DataFrame(df_markers)
-            color_scale = alt.Scale(domain=["start","end","repl"], range=["#188038","#202124","#f9ab00"])
-            pts = alt.Chart(dfm).mark_point(size=80, filled=True).encode(
-                longitude='lon:Q', latitude='lat:Q',
-                color=alt.Color('type:N', scale=color_scale, legend=alt.Legend(title="Marqueur"))
-            )
-            labels = alt.Chart(dfm).mark_text(dy=-10).encode(
-                longitude='lon:Q', latitude='lat:Q', text='label:N',
-                color=alt.Color('type:N', scale=color_scale, legend=None)
-            )
-            layers += [pts, labels]
-
-        # --- Zoom automatique : projection.fit sur le BBOX du détour --------
-        fit_feature = {
-            "type": "Feature",
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [[
-                    [lon_min, lat_min],
-                    [lon_min, lat_max],
-                    [lon_max, lat_max],
-                    [lon_max, lat_min],
-                    [lon_min, lat_min]
-                ]]
-            },
-            "properties": {}
-        }
-
-        chart = (
-            alt.layer(*layers)
-               .project(type='mercator', fit=fit_feature)  # calcule translate + scale automatiquement
-               .properties(width="container", height=380)
-               .interactive()
         )
 
-    else:
-        # --- Mode sans basemap : axes numériques + cadrage contrôlé ---------
-        x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False) if fix_scales else alt.Scale()
-        y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False) if fix_scales else alt.Scale()
-
-        base = alt.Chart(df_route).mark_line(color="#9aa0a6", strokeWidth=2).encode(
-            x=alt.X("lon:Q", title="Longitude", scale=x_scale),
-            y=alt.Y("lat:Q", title="Latitude",  scale=y_scale)
-        )
-        layers.append(base)
-
-        if df_segment is not None and not df_segment.empty:
-            layers.append(
-                alt.Chart(df_segment).mark_line(color="#d93025", strokeWidth=3).encode(
-                    x=alt.X("lon:Q", scale=x_scale),
-                    y=alt.Y("lat:Q", scale=y_scale)
-                )
-            )
-
-        if df_markers:
-            dfm = pd.DataFrame(df_markers)
-            color_scale = alt.Scale(domain=["start","end","repl"], range=["#188038","#202124","#f9ab00"])
-            layers.append(
-                alt.Chart(dfm).mark_point(size=80, filled=True).encode(
-                    x=alt.X("lon:Q", scale=x_scale),
-                    y=alt.Y("lat:Q", scale=y_scale),
-                    color=alt.Color("type:N", scale=color_scale, legend=alt.Legend(title="Marqueur"))
-                )
-            )
-            layers.append(
-                alt.Chart(dfm).mark_text(dy=-10).encode(
-                    x=alt.X("lon:Q", scale=x_scale),
-                    y=alt.Y("lat:Q", scale=y_scale),
-                    text="label:N",
-                    color=alt.Color("type:N", scale=color_scale, legend=None)
-                )
-            )
-
-        chart = alt.layer(*layers).properties(width="container", height=380).interactive()
-
+    chart = alt.layer(*layers).properties(width="container", height=380).interactive()
     return chart
 
 # -----------------------------------------------------------------------------
@@ -678,17 +523,13 @@ def _build_altair_layers_for_entity(
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Analyse TripModifications + GTFS", layout="wide")
 st.title("Analyse TripModifications (JSON/PB) vs GTFS")
-st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json/.pb), puis lance l’analyse. Visualisation Altair des détours incluse.")
+st.caption("Charge un GTFS statique (.zip) et un fichier TripModifications (.json/.pb), puis lance l’analyse. Visualisation Altair : polyline + arrêts temporaires (si disponibles).")
 
 with st.sidebar:
     st.header("Données d’entrée")
     gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
     tripmods_file = st.file_uploader("TripModifications (.json/.pb)", type=["json", "pb", "pbf", "bin"])
     dump_first = st.checkbox("Afficher le 1er trip_mod normalisé", value=False)
-    # En mode sans basemap, ces options contrôlent les axes numériques
-    fix_scales = st.checkbox("Ajuster l’échelle des axes (sans zéro)", value=True)
-    # Fond carto geoshape + zoom auto via FIT
-    use_basemap = st.checkbox("Afficher le fond carto (geoshape) + zoom automatique", value=True)
     run_btn = st.button("Analyser", type="primary")
 
 if run_btn:
@@ -740,13 +581,14 @@ if run_btn:
     st.subheader("Synthèse par entité")
     st.dataframe(table, use_container_width=True, height=360)
 
-    # Détails par entité (avec Altair)
+    # Détails par entité (polyline + arrêts temporaires)
     st.subheader("Détails")
     for r in reports[:200]:  # limite d'affichage
         with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
             st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
             st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
                      ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
+
             # Tableau par trip
             detail_rows = [{
                 "trip_id": t.trip_id,
@@ -758,16 +600,14 @@ if run_btn:
             } for t in r.trips]
             st.dataframe(detail_rows, use_container_width=True, height=240)
 
-            # Visualisation Altair (route + tronçon + marqueurs)
+            # Visualisation Altair : polyline seule + arrêts temporaires
             ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
             if ent_obj:
-                chart = _build_altair_layers_for_entity(ent_obj, rt, gtfs,
-                                                        fix_scales=fix_scales,
-                                                        use_basemap=use_basemap)
+                chart = _build_altair_chart_polyline_only(ent_obj, rt, gtfs)
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
                 else:
-                    st.info("Pas de shape exploitable pour visualiser ce détour.")
+                    st.info("Pas de shape exploitable pour visualiser cette entité.")
 
     # Export du rapport brut
     report_json = {
@@ -782,4 +622,4 @@ if run_btn:
     )
 else:
     st.info("Charge un GTFS (.zip) et un TripModifications (.json/.pb), puis clique **Analyser**.")
-    st.caption("Le parseur suit la structure du feed (selected_trips, service_dates, modifications, etc.).")
+    st.caption("Affichage : polyline (shape GTFS) + arrêts de remplacement si disponibles, avec cadrage automatique.")
