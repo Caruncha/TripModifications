@@ -1,11 +1,12 @@
 # app.py — Analyse TripModifications (JSON/PB) vs GTFS — Mémoire réduite + tracé encoded_polyline
 # -----------------------------------------------------------------------------------------------
-# Points clés :
-# - Normalisation JSON camelCase → snake_case (parser tolérant à la casse).
-# - Chargement GTFS FILTRÉ : ne lit que les trips/stops référencés par TripModifications.
-# - Visualisation par entité du champ "encoded_polyline" (depuis le feed TripModifications),
-#   avec cadrage automatique sur min/max(lon/lat) du tracé.
-# - Aucune carte de fond ; repère X/Y purement numérique (lon/lat).
+# Nouveautés :
+# - Décodage des polylines via la librairie 'polyline' (auto-détection précision 1e5 / 1e6),
+#   avec repli sur un décodeur interne si la dépendance n'est pas installée.
+# - Le tracé est cadré sur (min/max) lon/lat du chemin (padding léger), sans fond de carte.
+#
+# Dépendances utiles :
+#   pip install streamlit altair pandas polyline
 # -----------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -114,43 +115,90 @@ class RtShapes:
     shapes: Dict[str, List[Tuple[float, float]]]  # shape_id -> [(lat, lon), ...]
 
 # -----------------------------------------------------------------------------------------------
-# 3) Utilitaires polylines (Google encoded polyline)
+# 3) Décodage polyline — via librairie 'polyline' (auto 1e5/1e6) avec repli interne
 # -----------------------------------------------------------------------------------------------
-def decode_polyline(encoded: str) -> List[Tuple[float, float]]:
-    """
-    Décode une polyline Google en liste [(lat, lon), ...].
-    Implémente l'algorithme standard (deltas encodés base64+5 bits).
-    """
+def _legacy_decode_polyline(encoded: str) -> List[Tuple[float, float]]:
+    """Décodeur interne (fallback) — algorithme Google standard (précision 1e5)."""
     coords = []
     index, lat, lon = 0, 0, 0
-    length = len(encoded)
-    while index < length:
+    encoded = (encoded or "").strip()
+    L = len(encoded)
+    while index < L:
         # latitude
-        shift, result = 0, 0
+        result = 0; shift = 0
         while True:
-            b = ord(encoded[index]) - 63
-            index += 1
-            result |= (b & 0x1f) << shift
-            shift += 5
-            if b < 0x20:
-                break
+            b = ord(encoded[index]) - 63; index += 1
+            result |= (b & 0x1f) << shift; shift += 5
+            if b < 0x20: break
         dlat = ~(result >> 1) if (result & 1) else (result >> 1)
         lat += dlat
-
         # longitude
-        shift, result = 0, 0
+        result = 0; shift = 0
         while True:
-            b = ord(encoded[index]) - 63
-            index += 1
-            result |= (b & 0x1f) << shift
-            shift += 5
-            if b < 0x20:
-                break
+            b = ord(encoded[index]) - 63; index += 1
+            result |= (b & 0x1f) << shift; shift += 5
+            if b < 0x20: break
         dlon = ~(result >> 1) if (result & 1) else (result >> 1)
         lon += dlon
-
         coords.append((lat / 1e5, lon / 1e5))
     return coords
+def _bbox_span(coords: List[Tuple[float,float]]) -> float:
+    if not coords:
+        return 0.0
+    lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
+    return (max(lats)-min(lats)) + (max(lons)-min(lons))
+
+def decode_polyline_smart(encoded: str) -> List[Tuple[float, float]]:
+    """
+    Tente d'abord le décodage avec la librairie 'polyline' :
+      - precision=5 (1e5), si hors bornes → precision=6 (1e6)
+      - si les deux sont plausibles, on compare le "span" et on choisit le plus réaliste.
+    Repli : décodeur interne 1e5.
+    """
+    encoded = (encoded or "").strip()
+    if not encoded:
+        return []
+
+    try:
+        import polyline as pl
+    except Exception:
+        # Librairie non installée → fallback
+        return _legacy_decode_polyline(encoded)
+
+    # 1) Essai précision 5
+    try:
+        c5 = pl.decode(encoded, precision=5)
+    except Exception:
+        c5 = []
+
+    # Hors bornes ? → essai précision 6
+    def _valid(cs): 
+        return cs and all(-90 <= la <= 90 and -180 <= lo <= 180 for la,lo in cs)
+
+    if not _valid(c5):
+        try:
+            c6 = pl.decode(encoded, precision=6)
+            return c6 if _valid(c6) else _legacy_decode_polyline(encoded)
+        except Exception:
+            return _legacy_decode_polyline(encoded)
+
+    # 2) Essai précision 6 aussi (pour comparer les spans)
+    try:
+        c6 = pl.decode(encoded, precision=6)
+    except Exception:
+        c6 = []
+
+    if not _valid(c6):
+        return c5  # seul plausible
+
+    # 3) Choix heuristique : si les spans diffèrent sensiblement, on garde le plus plausible.
+    s5, s6 = _bbox_span(c5), _bbox_span(c6)
+    if s6 > 1.5 * s5:
+        return c6
+    if s5 > 1.5 * s6:
+        return c5
+    # Sinon, par défaut on reste sur précision 5 (GTFS classique)
+    return c5
 
 # -----------------------------------------------------------------------------------------------
 # 4) Parsing TripModifications & Shapes
@@ -217,7 +265,7 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
                 if r:
                     repl_list.append(r)
             start_sel = _coerce_selector(m.get('start_stop_selector') or {})
-            end_sel = _coerce_selector(m.get('end_stop_selector') or {})
+            end_sel   = _coerce_selector(m.get('end_stop_selector') or {})
             mods.append(Modification(
                 start_stop_selector=start_sel,
                 end_stop_selector=end_sel,
@@ -242,7 +290,7 @@ def _collect_shapes_json(feed: Dict[str, Any]) -> RtShapes:
             enc = sh.get('encoded_polyline')
             if sid and enc:
                 try:
-                    shapes[sid] = decode_polyline(enc)
+                    shapes[sid] = decode_polyline_smart(enc)
                 except Exception:
                     pass
     return RtShapes(shapes=shapes)
@@ -309,7 +357,7 @@ def _collect_shapes_pb(data: bytes) -> RtShapes:
             enc = ent.shape.encoded_polyline
             if sid and enc:
                 try:
-                    shapes[sid] = decode_polyline(enc)
+                    shapes[sid] = decode_polyline_smart(enc)
                 except Exception:
                     pass
     return RtShapes(shapes=shapes)
@@ -326,7 +374,6 @@ def load_tripmods_bytes(file_bytes: bytes) -> Tuple[List[TripModEntity], Optiona
         feed = _normalize_json_keys(raw)  # <-- normalisation des clés
         ents = parse_tripmods_json(feed)
         shapes = _collect_shapes_json(feed)
-        # Optional : ne conserver que les shapes utiles (shape_id présents dans ents)
         needed_shape_ids = {s.shape_id for e in ents for s in e.selected_trips if s.shape_id}
         if needed_shape_ids:
             shapes.shapes = {sid: poly for sid, poly in shapes.shapes.items() if sid in needed_shape_ids}
@@ -622,7 +669,6 @@ if run_btn:
             st.dataframe(detail_rows, use_container_width=True, height=220)
 
             # --- Tracé encoded_polyline (si shape disponible) ----------------
-            # On prend le premier shape_id trouvé dans selected_trips qui existe dans rt_shapes
             ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
             shape_id = None
             if ent_obj:
@@ -652,4 +698,5 @@ if run_btn:
 
 else:
     st.info("Charge un TripModifications (.json/.pb) puis un GTFS (.zip), et clique **Analyser**.")
-    st.caption("Les shapes (encoded_polyline) sont lues depuis le feed TripModifications, et le GTFS est filtré.")
+    st.caption("Les shapes (encoded_polyline) sont lues depuis le feed TripModifications ; le GTFS est filtré.")
+``
