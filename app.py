@@ -1,12 +1,11 @@
-# app.py — Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Mémoire réduite + polylines fiables
-# ---------------------------------------------------------------------------------------------------
-# - Gère JSON, Protobuf binaire et dump ASCII "textproto" de GTFS-RT (entity trip_modifications & shape)
-# - Sépare strictement 'trip_modifications' (entités) et 'shape' (tracés)
-# - Décodage polyline avec lib 'polyline' (Auto / 1e-5 / 1e-6) + déséchappage ciblé
-# - Visualisation Altair : ligne + points rouges, ordre explicite (idx)
-# - GTFS filtré (mémoire réduite) ; tableau Détails avec colonnes d'anomalies
-# - UI : KPI "Shapes dans le feed", et "Shape utilisé pour le tracé" dans chaque entité
-# ---------------------------------------------------------------------------------------------------
+# app.py — Analyse TripModifications (JSON/PB/Textproto) vs GTFS — "TripMods only"
+# --------------------------------------------------------------------------------
+# - Traite UNIQUEMENT les entités qui contiennent trip_modifications
+# - Ignore totalement les entités 'shape' et les ReplacementStop (arrêts temporaires)
+# - GTFS filtré (mémoire réduite) sur la base des trip_ids sélectionnés
+# - Détails/anomalies: uniquement sur la structure TripMods + stop_times
+# - Labo polyline (🧪) conservé pour debug manuel (hors analyse principale)
+# - Compat Streamlit: st.altair_chart(..., use_container_width=True) ; st.dataframe(..., width="stretch")
 
 from __future__ import annotations
 import streamlit as st
@@ -18,9 +17,9 @@ from pathlib import Path
 import pandas as pd
 import altair as alt
 
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -29,9 +28,9 @@ try:
 except Exception:
     gtfs_local = None
 
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 # 1) camelCase → snake_case
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 _CAMEL_RE = re.compile(r'(?<!^)(?=[A-Z])')
 def _camel_to_snake(name: str) -> str:
     return _CAMEL_RE.sub('_', name).lower()
@@ -47,30 +46,23 @@ def _normalize_json_keys(obj):
         return [_normalize_json_keys(x) for x in obj]
     return obj
 
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 # 2) Modèles
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 @dataclass
 class StopSelector:
     stop_sequence: Optional[int] = None
     stop_id: Optional[str] = None
 
 @dataclass
-class ReplacementStop:
-    stop_id: str
-    travel_time_to_stop: int = 0
-
-@dataclass
 class Modification:
     start_stop_selector: Optional[StopSelector] = None
     end_stop_selector: Optional[StopSelector] = None
-    replacement_stops: List[ReplacementStop] = field(default_factory=list)
-    propagated_modification_delay: Optional[int] = None
 
 @dataclass
 class SelectedTrips:
     trip_ids: List[str] = field(default_factory=list)
-    shape_id: Optional[str] = None
+    shape_id: Optional[str] = None  # peut rester utile en info, mais non tracée
 
 @dataclass
 class TripModEntity:
@@ -84,7 +76,6 @@ class TripModEntity:
 class GtfsStatic:
     trips: Dict[str, Dict[str, str]]
     stop_times: Dict[str, List[Dict[str, str]]]
-    stops_present: Set[str]
 
 @dataclass
 class TripCheck:
@@ -103,22 +94,11 @@ class EntityReport:
     service_dates: List[str]
     modification_count: int
     trips: List[TripCheck]
-    replacement_stops_unknown_in_gtfs: List[str] = field(default_factory=list)
 
-@dataclass
-class RtShapes:
-    shapes: Dict[str, List[Tuple[float, float]]]  # shape_id -> [(lat, lon), ...]
-
-# ---------------------------------------------------------------------------------------------------
-# 3) Décodage polyline (nettoyage SANS unicode_escape) + Auto/5/6 + fallback
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
+# 3) Polyline — labo (facultatif), pas utilisé par l’analyse principale
+# --------------------------------------------------------------------------------
 def _sanitize_polyline(s: str) -> str:
-    """
-    Nettoyage minimal :
-    - retire espaces/retours
-    - remplace \\n, \\r, \\t par vide
-    - remplace \\\\ par \\ (déséchappage simple)
-    """
     if not s:
         return s
     s = s.strip()
@@ -188,15 +168,60 @@ def decode_polyline(encoded: str, mode: str = "auto") -> List[Tuple[float, float
         return c6 if span(c6) > span(c5)*1.3 else c5
     return _legacy_decode_polyline(enc)
 
-# ---------------------------------------------------------------------------------------------------
-# 4) Parsing TripMods & Shapes — JSON / PB / TEXTPROTO
-# ---------------------------------------------------------------------------------------------------
+def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor: float = 1e-4):
+    if not coords:
+        return (-180.0, 180.0), (-90.0, 90.0)
+    lats = [la for la, _ in coords]; lons = [lo for _, lo in coords]
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
+    span_lat = max(lat_max - lat_min, floor)
+    span_lon = max(lon_max - lon_min, floor)
+    pad_lat = max(span_lat * frac, floor)
+    pad_lon = max(span_lon * frac, floor)
+    return (lon_min - pad_lon, lon_max + pad_lon), (lat_min - pad_lat, lat_max + pad_lat)
+
+def build_chart_for_polyline(poly: List[Tuple[float, float]], show_index_labels: bool = True):
+    if not poly or len(poly) < 2:
+        return None
+    df_route = pd.DataFrame([{"lat": la, "lon": lo, "idx": i} for i, (la, lo) in enumerate(poly)])
+    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain(poly)
+    x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
+    y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
+
+    line = (
+        alt.Chart(df_route)
+           .mark_line(color="#1f77b4", strokeWidth=3)
+           .encode(
+               x=alt.X("lon:Q", title="Longitude", scale=x_scale),
+               y=alt.Y("lat:Q", title="Latitude", scale=y_scale),
+               order=alt.Order("idx:Q")
+           )
+    )
+    points = (
+        alt.Chart(df_route)
+           .mark_circle(color="red", size=40, opacity=0.9)
+           .encode(
+               x=alt.X("lon:Q", scale=x_scale),
+               y=alt.Y("lat:Q", scale=y_scale),
+               tooltip=[alt.Tooltip("idx:Q", title="#"), alt.Tooltip("lat:Q"), alt.Tooltip("lon:Q")]
+           )
+    )
+    labels = None
+    if show_index_labels and len(df_route) <= 200:
+        labels = (
+            alt.Chart(df_route)
+               .mark_text(align="left", dx=4, dy=-4, fontSize=10, color="red")
+               .encode(x="lon:Q", y="lat:Q", text="idx:Q")
+        )
+    chart = (line + points if labels is None else line + points + labels).properties(
+        width="container", height=360, title="Labo polyline (hors analyse TripMods)"
+    ).interactive()
+    return chart
+
+# --------------------------------------------------------------------------------
+# 4) Parsing TripMods — JSON / PB / TEXTPROTO (shapes ignorés)
+# --------------------------------------------------------------------------------
 def _detect_tripmods_format_bytes(b: bytes) -> str:
-    """
-    'json'      : commence par { ou [
-    'textproto' : ASCII lisible avec 'entity', 'trip_modifications' ou 'shape'
-    'pb'        : par défaut
-    """
     head = (b[:4096] or b'')
     hs = head.lstrip()
     if hs.startswith(b'{') or hs.startswith(b'['):
@@ -205,7 +230,8 @@ def _detect_tripmods_format_bytes(b: bytes) -> str:
         txt = head.decode('utf-8', 'ignore')
     except Exception:
         return 'pb'
-    if any(s in txt for s in ('entity', 'trip_modifications', 'shape', 'encoded_polyline', 'shape_id')):
+    if any(s in txt for s in ('entity', 'trip_modifications', 'shape', 'shape_id')):
+        # On traitera "textproto" mais on ignorera les blocs 'shape'
         return 'textproto'
     return 'pb'
 
@@ -219,15 +245,6 @@ def _coerce_selector(obj: Dict[str, Any]) -> StopSelector:
     except Exception:
         seq = None
     return StopSelector(stop_sequence=seq, stop_id=sid if (sid or None) else None)
-
-def _coerce_repl_stop(obj: Dict[str, Any]) -> Optional[ReplacementStop]:
-    if not isinstance(obj, dict): return None
-    sid = obj.get('stop_id')
-    if not sid: return None
-    t = obj.get('travel_time_to_stop', 0)
-    try: t = int(t)
-    except Exception: t = 0
-    return ReplacementStop(stop_id=str(sid), travel_time_to_stop=t)
 
 def _coerce_selected_trips(obj: Dict[str, Any]) -> SelectedTrips:
     trips = obj.get('trip_ids') or []
@@ -244,7 +261,7 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
     for e in entities:
         tm = e.get('trip_modifications')
         if not tm:
-            continue
+            continue  # ignore tout sauf trip_modifications
         sel_raw = tm.get('selected_trips') or []
         selected = [_coerce_selected_trips(s) for s in sel_raw]
         service_dates = tm.get('service_dates') or []
@@ -256,40 +273,17 @@ def parse_tripmods_json(feed: Dict[str, Any]) -> List[TripModEntity]:
         start_times = [str(t) for t in tm.get('start_times') or []]
         mods: List[Modification] = []
         for m in tm.get('modifications') or []:
-            repl_list = []
-            for rs in m.get('replacement_stops') or []:
-                r = _coerce_repl_stop(rs)
-                if r: repl_list.append(r)
             start_sel = _coerce_selector(m.get('start_stop_selector') or {})
             end_sel   = _coerce_selector(m.get('end_stop_selector') or {})
-            mods.append(Modification(
-                start_stop_selector=start_sel,
-                end_stop_selector=end_sel,
-                replacement_stops=repl_list,
-                propagated_modification_delay=m.get('propagated_modification_delay')
-            ))
+            mods.append(Modification(start_stop_selector=start_sel, end_stop_selector=end_sel))
         out.append(TripModEntity(
-            entity_id=str(e.get('id')),
+            entity_id=str(e.get('id') or ''),
             selected_trips=selected,
             service_dates=service_dates,
             start_times=start_times,
             modifications=mods
         ))
     return out
-
-def _collect_shapes_json(feed: Dict[str, Any], decode_mode: str) -> RtShapes:
-    shapes: Dict[str, List[Tuple[float, float]]] = {}
-    for e in feed.get('entity', []):
-        sh = e.get('shape')
-        if sh and isinstance(sh, dict):
-            sid = str(sh.get('shape_id') or '')
-            enc = sh.get('encoded_polyline')
-            if sid and enc:
-                try:
-                    shapes[sid] = decode_polyline(enc, mode=decode_mode)
-                except Exception:
-                    pass
-    return RtShapes(shapes=shapes)
 
 # ---- Protobuf binaire ----
 def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
@@ -311,9 +305,6 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         start_times = list(getattr(tm, 'start_times', []))
         mods: List[Modification] = []
         for m in getattr(tm, 'modifications', []):
-            repl = [ReplacementStop(stop_id=rs.stop_id,
-                                    travel_time_to_stop=int(getattr(rs, 'travel_time_to_stop', 0)))
-                    for rs in getattr(m, 'replacement_stops', [])]
             start_sel = StopSelector(
                 stop_sequence=getattr(m.start_stop_selector, 'stop_sequence', None) if hasattr(m, 'start_stop_selector') else None,
                 stop_id=getattr(m.start_stop_selector, 'stop_id', None) if hasattr(m, 'start_stop_selector') else None,
@@ -322,12 +313,7 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
                 stop_sequence=getattr(m.end_stop_selector, 'stop_sequence', None) if hasattr(m, 'end_stop_selector') else None,
                 stop_id=getattr(m.end_stop_selector, 'stop_id', None) if hasattr(m, 'end_stop_selector') else None,
             )
-            mods.append(Modification(
-                start_stop_selector=start_sel,
-                end_stop_selector=end_sel,
-                replacement_stops=repl,
-                propagated_modification_delay=getattr(m, 'propagated_modification_delay', None)
-            ))
+            mods.append(Modification(start_stop_selector=start_sel, end_stop_selector=end_sel))
         out.append(TripModEntity(
             entity_id=str(getattr(ent, 'id', '')),
             selected_trips=selected,
@@ -337,42 +323,16 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         ))
     return out
 
-def _collect_shapes_pb(data: bytes, decode_mode: str) -> RtShapes:
-    shapes: Dict[str, List[Tuple[float, float]]] = {}
-    proto = gtfs_local
-    if proto is None:
-        try:
-            from google.transit import gtfs_realtime_pb2 as proto
-        except Exception:
-            return RtShapes(shapes)
-    feed = proto.FeedMessage(); feed.ParseFromString(data)
-    for ent in feed.entity:
-        if hasattr(ent, 'shape') and ent.shape and getattr(ent.shape, 'encoded_polyline', None):
-            sid = str(getattr(ent.shape, 'shape_id', '') or '')
-            enc = ent.shape.encoded_polyline
-            if sid and enc:
-                try:
-                    shapes[sid] = decode_polyline(enc, mode=decode_mode)
-                except Exception:
-                    pass
-    return RtShapes(shapes=shapes)
-
-# ---- TEXTPROTO (dump ASCII) ----
+# ---- TEXTPROTO (dump ASCII) — shapes ignorés
 def _lines(b: bytes):
     for raw in b.decode('utf-8', 'ignore').splitlines():
         yield raw.strip()
 
-def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity], RtShapes]:
+def parse_textproto_tripmods_only(b: bytes) -> List[TripModEntity]:
     ents: List[TripModEntity] = []
-    shapes: Dict[str, List[Tuple[float, float]]] = {}
-
     cur_id: Optional[str] = None
     in_tm = False
-    in_shape = False
-    capturing_poly = False
-
     tm_buf: Dict[str, Any] = {}
-    shape_buf: Dict[str, Any] = {}
 
     def _flush_tm():
         nonlocal tm_buf, cur_id
@@ -383,7 +343,7 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
         start_times = tm_buf.get('start_times', [])
         modifications = tm_buf.get('modifications', [])
         ents.append(TripModEntity(
-            entity_id=str(cur_id or ""),
+            entity_id=str(cur_id or ''),
             selected_trips=selected,
             service_dates=service_dates,
             start_times=start_times,
@@ -391,50 +351,18 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
         ))
         tm_buf = {}
 
-    def _flush_shape():
-        nonlocal shape_buf
-        if shape_buf.get('shape_id') and shape_buf.get('encoded_polyline'):
-            sid = str(shape_buf['shape_id'])
-            enc = str(shape_buf['encoded_polyline'])
-            try:
-                shapes[sid] = decode_polyline(enc, mode=decode_mode)
-            except Exception:
-                pass
-        shape_buf = {}
-
     def _start_new_entity(new_id: Optional[str]):
-        nonlocal in_tm, in_shape, capturing_poly, cur_id
-        if in_tm: _flush_tm()
-        if in_shape: _flush_shape()
+        nonlocal in_tm, cur_id
+        if in_tm:
+            _flush_tm()
         in_tm = False
-        in_shape = False
-        capturing_poly = False
         cur_id = new_id
 
     for line in _lines(b):
         if not line:
-            # lignes vides : si on capturait l'encoded polyline, on continue (elles peuvent faire partie du flux échappé)
             continue
-
-        # Si on capturait la polyline, on regarde si la ligne marque un nouveau bloc
-        if capturing_poly:
-            if (line.startswith('id ') or line.startswith('entity') or
-                line.startswith('shape_id ') or line.startswith('trip_modifications') or
-                line.startswith('shape ') or line.startswith('selected_trips') or
-                line.startswith('service_dates ') or line.startswith('start_times ') or
-                line.startswith('modifications ') or line.startswith('start_stop_selector') or
-                line.startswith('end_stop_selector') or line.startswith('replacement_stops') or
-                line.startswith('encoded_polyline ')):
-                # fin de capture, on NE consomme PAS la ligne : on la retraitera ci-dessous
-                capturing_poly = False
-                # pas de 'continue' ici — on laisse la ligne être traitée plus bas
-            else:
-                # concaténation de la chaîne encodée
-                shape_buf['encoded_polyline'] = shape_buf.get('encoded_polyline', '') + line
-                continue
-
-        # Début d'une nouvelle entité
         if line.startswith('entity') or line.startswith('id '):
+            # nouvelle entité
             new_id = None
             if line.startswith('id '):
                 new_id = line[3:].strip()
@@ -445,20 +373,18 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
             _start_new_entity(new_id)
             continue
 
-        # Entrée dans un bloc
         if line.startswith('trip_modifications'):
-            in_tm, in_shape, capturing_poly = True, False, False
+            in_tm = True
             tm_buf = dict(selected_trips=[], service_dates=[], start_times=[], modifications=[])
             continue
         if line.startswith('shape'):
-            in_tm, in_shape, capturing_poly = False, True, False
-            shape_buf = {}
+            # on ignore totalement les blocs shape
+            in_tm = False
+            tm_buf = {}
             continue
 
-        # --- Bloc Trip Modifications ---
         if in_tm:
             if line.startswith('selected_trips'):
-                # marqueur seulement ; on créera/complètera SelectedTrips avec trip_ids/shape_id
                 continue
             if line.startswith('trip_ids '):
                 ids = line[len('trip_ids '):].strip().split()
@@ -479,19 +405,16 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
                 tm_buf['start_times'] += line[len('start_times '):].strip().split()
                 continue
             if line.startswith('modifications'):
-                # marqueur ; la 1re occurrence de start_stop_selector démarrera un Modification si besoin
                 continue
             if line.startswith('start_stop_selector'):
                 tm_buf['modifications'].append(Modification(
-                    start_stop_selector=StopSelector(), end_stop_selector=StopSelector(),
-                    replacement_stops=[]
+                    start_stop_selector=StopSelector(), end_stop_selector=StopSelector()
                 ))
                 continue
             if line.startswith('end_stop_selector'):
                 if not tm_buf['modifications']:
                     tm_buf['modifications'].append(Modification(
-                        start_stop_selector=StopSelector(), end_stop_selector=StopSelector(),
-                        replacement_stops=[]
+                        start_stop_selector=StopSelector(), end_stop_selector=StopSelector()
                     ))
                 continue
             if line.startswith('stop_sequence '):
@@ -506,94 +429,45 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity
                         if m.end_stop_selector is None: m.end_stop_selector = StopSelector()
                         m.end_stop_selector.stop_sequence = seq
                 continue
-            if line.startswith('replacement_stops'):
-                if not tm_buf['modifications']:
-                    tm_buf['modifications'].append(Modification(
-                        start_stop_selector=StopSelector(), end_stop_selector=StopSelector(),
-                        replacement_stops=[]
-                    ))
-                continue
-            if line.startswith('stop_id '):
-                sid = line[len('stop_id '):].strip()
-                if tm_buf['modifications']:
-                    tm_buf['modifications'][-1].replacement_stops.append(
-                        ReplacementStop(stop_id=sid, travel_time_to_stop=0)
-                    )
-                continue
-            # autres lignes ignorées côté TM
+            # toute autre ligne en TM ignorée
             continue
 
-        # --- Bloc Shape ---
-        if in_shape:
-            if line.startswith('shape_id '):
-                shape_buf['shape_id'] = line[len('shape_id '):].strip()
-                continue
-            if line.startswith('encoded_polyline '):
-                enc = line[len('encoded_polyline '):]
-                shape_buf['encoded_polyline'] = enc
-                capturing_poly = True
-                continue
-            # autres lignes ignorées (ex: bruit)
-            continue
+    if in_tm:
+        _flush_tm()
+    return ents
 
-    # flush final
-    if in_tm: _flush_tm()
-    if in_shape: _flush_shape()
-
-    return ents, RtShapes(shapes=shapes)
-
-def load_tripmods_bytes(file_bytes: bytes, decode_mode: str) -> Tuple[List[TripModEntity], Optional[Dict[str, Any]], RtShapes]:
+def load_tripmods_bytes(file_bytes: bytes):
     fmt = _detect_tripmods_format_bytes(file_bytes)
     if fmt == 'json':
         raw = json.loads(file_bytes.decode('utf-8'))
         feed = _normalize_json_keys(raw)
         ents = parse_tripmods_json(feed)
-        shapes = _collect_shapes_json(feed, decode_mode)
-        needed_shape_ids = {s.shape_id for e in ents for s in e.selected_trips if s.shape_id}
-        if needed_shape_ids:
-            shapes.shapes = {sid: poly for sid, poly in shapes.shapes.items() if sid in needed_shape_ids}
-        return ents, feed, shapes
+        return ents, feed
     if fmt == 'textproto':
-        ents, shapes = parse_textproto_feed(file_bytes, decode_mode=decode_mode)
-        needed_shape_ids = {s.shape_id for e in ents for s in e.selected_trips if s.shape_id}
-        if needed_shape_ids:
-            shapes.shapes = {sid: poly for sid, poly in shapes.shapes.items() if sid in needed_shape_ids}
-        return ents, None, shapes
+        ents = parse_textproto_tripmods_only(file_bytes)
+        return ents, None
     # PB binaire
     ents = parse_tripmods_protobuf(file_bytes)
-    shapes = _collect_shapes_pb(file_bytes, decode_mode)
-    needed_shape_ids = {s.shape_id for e in ents for s in e.selected_trips if s.shape_id}
-    if needed_shape_ids:
-        shapes.shapes = {sid: poly for sid, poly in shapes.shapes.items() if sid in needed_shape_ids}
-    return ents, None, shapes
+    return ents, None
 
-# ---------------------------------------------------------------------------------------------------
-# 5) Ensembles cibles (GTFS filtré)
-# ---------------------------------------------------------------------------------------------------
-def compute_needed_sets(ents: List[TripModEntity]) -> Tuple[Set[str], Set[str]]:
+# --------------------------------------------------------------------------------
+# 5) Ensembles cibles (GTFS filtré) — uniquement trip_ids (pas de stops)
+# --------------------------------------------------------------------------------
+def compute_needed_trip_ids(ents: List[TripModEntity]) -> Set[str]:
     needed_trip_ids: Set[str] = set()
-    needed_stop_ids: Set[str] = set()
     for e in ents:
         for s in e.selected_trips:
             needed_trip_ids.update([str(tid) for tid in s.trip_ids if tid])
-        for m in e.modifications:
-            for rs in m.replacement_stops:
-                if rs.stop_id:
-                    needed_stop_ids.add(str(rs.stop_id))
-            for sel in (m.start_stop_selector, m.end_stop_selector):
-                if sel and sel.stop_id:
-                    needed_stop_ids.add(str(sel.stop_id))
-    return needed_trip_ids, needed_stop_ids
+    return needed_trip_ids
 
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
 # 6) Chargement GTFS FILTRÉ
-# ---------------------------------------------------------------------------------------------------
-def load_gtfs_zip_filtered_bytes(zip_bytes: bytes, needed_trip_ids: Set[str], needed_stop_ids: Set[str]) -> GtfsStatic:
+# --------------------------------------------------------------------------------
+def load_gtfs_zip_filtered_bytes(zip_bytes: bytes, needed_trip_ids: Set[str]) -> GtfsStatic:
     trips: Dict[str, Dict[str, str]] = {}
     stop_times: Dict[str, List[Dict[str, str]]] = {}
-    stops_present: Set[str] = set()
-    if not needed_trip_ids and not needed_stop_ids:
-        return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present)
+    if not needed_trip_ids:
+        return GtfsStatic(trips=trips, stop_times=stop_times)
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
         if 'trips.txt' in zf.namelist() and needed_trip_ids:
             with zf.open('trips.txt') as f:
@@ -615,17 +489,11 @@ def load_gtfs_zip_filtered_bytes(zip_bytes: bytes, needed_trip_ids: Set[str], ne
                         stop_times.setdefault(tid, []).append(rec)
             for tid, lst in stop_times.items():
                 lst.sort(key=lambda x: int(x['stop_sequence'] or 0))
-        if 'stops.txt' in zf.namelist() and needed_stop_ids:
-            with zf.open('stops.txt') as f:
-                for row in csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig', newline='')):
-                    sid = (row.get('stop_id') or '').strip()
-                    if sid in needed_stop_ids:
-                        stops_present.add(sid)
-    return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present)
+    return GtfsStatic(trips=trips, stop_times=stop_times)
 
-# ---------------------------------------------------------------------------------------------------
-# 7) Analyse
-# ---------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
+# 7) Analyse (sans ReplacementStop ni shapes)
+# --------------------------------------------------------------------------------
 def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]]) -> Optional[int]:
     if sel is None:
         return None
@@ -641,10 +509,9 @@ def _seq_from_selector(sel: StopSelector, stop_times_list: List[Dict[str, str]])
 def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> Tuple[List[EntityReport], Dict[str, int]]:
     reports: List[EntityReport] = []
     totals = dict(total_entities=len(ents), total_trip_ids=0, total_modifications=0,
-                  missing_trip_ids=0, invalid_selectors=0, unknown_replacement_stops=0)
+                  missing_trip_ids=0, invalid_selectors=0)
     for e in ents:
         trip_checks: List[TripCheck] = []
-        repl_unknown: List[str] = []
         tot_trip_ids = sum(len(sel.trip_ids) for sel in e.selected_trips)
         for sel in e.selected_trips:
             for trip_id in sel.trip_ids:
@@ -657,6 +524,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                     notes.append("trip_id absent du GTFS (filtré ou inexistant)")
                     totals["missing_trip_ids"] += 1
                 else:
+                    # on teste chaque modification (si plusieurs, on retient la 1ère séquence résolue)
                     for m in e.modifications:
                         sseq = _seq_from_selector(m.start_stop_selector, st_list) if st_list else None
                         eseq = _seq_from_selector(m.end_stop_selector, st_list) if st_list else None
@@ -672,12 +540,6 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
                     start_seq_valid=start_ok, end_seq_valid=end_ok,
                     start_seq=start_seq, end_seq=end_seq, notes=notes
                 ))
-        for m in e.modifications:
-            for rs in m.replacement_stops:
-                sid = rs.stop_id
-                if sid and sid not in gtfs.stops_present:
-                    repl_unknown.append(sid)
-                    totals["unknown_replacement_stops"] += 1
         totals["total_trip_ids"] += tot_trip_ids
         totals["total_modifications"] += len(e.modifications)
         reports.append(EntityReport(
@@ -685,141 +547,86 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
             total_selected_trip_ids=tot_trip_ids,
             service_dates=e.service_dates,
             modification_count=len(e.modifications),
-            trips=trip_checks,
-            replacement_stops_unknown_in_gtfs=sorted(set(repl_unknown))
+            trips=trip_checks
         ))
     return reports, totals
 
-# ---------------------------------------------------------------------------------------------------
-# 8) Visualisation (Altair) — ligne + points rouges + ordre idx
-# ---------------------------------------------------------------------------------------------------
-def _compute_domain(coords: List[Tuple[float, float]], frac: float = 0.03, floor: float = 1e-4):
-    if not coords:
-        return (-180.0, 180.0), (-90.0, 90.0)
-    lats = [la for la, _ in coords]; lons = [lo for _, lo in coords]
-    lat_min, lat_max = min(lats), max(lats)
-    lon_min, lon_max = min(lons), max(lons)
-    span_lat = max(lat_max - lat_min, floor)
-    span_lon = max(lon_max - lon_min, floor)
-    pad_lat = max(span_lat * frac, floor)
-    pad_lon = max(span_lon * frac, floor)
-    return (lon_min - pad_lon, lon_max + pad_lon), (lat_min - pad_lat, lat_max + pad_lat)
-
-def build_chart_for_polyline(poly: List[Tuple[float, float]], shape_id: Optional[str] = None, show_index_labels: bool = False):
-    if not poly or len(poly) < 2:
-        return None
-    df_route = pd.DataFrame([{"lat": la, "lon": lo, "idx": i} for i, (la, lo) in enumerate(poly)])
-    (lon_min, lon_max), (lat_min, lat_max) = _compute_domain(poly)
-    x_scale = alt.Scale(domain=[lon_min, lon_max], zero=False, nice=False)
-    y_scale = alt.Scale(domain=[lat_min, lat_max], zero=False, nice=False)
-    title = f"Tracé (encoded_polyline){' — ' + shape_id if shape_id else ''}"
-
-    line = (
-        alt.Chart(df_route)
-           .mark_line(color="#1f77b4", strokeWidth=3)
-           .encode(
-               x=alt.X("lon:Q", title="Longitude", scale=x_scale),
-               y=alt.Y("lat:Q", title="Latitude", scale=y_scale),
-               order=alt.Order("idx:Q")  # ordre explicite selon l'index
-           )
-    )
-
-    points = (
-        alt.Chart(df_route)
-           .mark_circle(color="red", size=40, opacity=0.9)
-           .encode(
-               x=alt.X("lon:Q", scale=x_scale),
-               y=alt.Y("lat:Q", scale=y_scale),
-               tooltip=[alt.Tooltip("idx:Q", title="#"), alt.Tooltip("lat:Q"), alt.Tooltip("lon:Q")]
-           )
-    )
-
-    labels = None
-    if show_index_labels and len(df_route) <= 200:
-        labels = (
-            alt.Chart(df_route)
-               .mark_text(align="left", dx=4, dy=-4, fontSize=10, color="red")
-               .encode(
-                   x=alt.X("lon:Q", scale=x_scale),
-                   y=alt.Y("lat:Q", scale=y_scale),
-                   text="idx:Q"
-               )
-        )
-
-    chart_base = line + points if labels is None else line + points + labels
-    chart = chart_base.properties(width="container", height=360, title=title).interactive()
-    return chart
-
-# ---------------------------------------------------------------------------------------------------
-# 9) UI Streamlit
-# ---------------------------------------------------------------------------------------------------
-st.set_page_config(page_title="Analyse TripModifications + GTFS — JSON/PB/Textproto + polylines", layout="wide")
-st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Mémoire réduite")
-st.caption("Les polylines sont nettoyées (déséchappage léger), décodées (Auto/1e‑5/1e‑6) et affichées avec des points rouges. "
-           "Support du format textproto (dump ASCII GTFS‑RT) — séparation claire entre entités TripMods et Shapes.")
+# --------------------------------------------------------------------------------
+# 8) UI Streamlit
+# --------------------------------------------------------------------------------
+st.set_page_config(page_title="Analyse TripModifications — TripMods only", layout="wide")
+st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — TripMods uniquement")
+st.caption("Seules les entités contenant **trip_modifications** sont traitées. "
+           "**Aucune** analyse des entités shape, ni des ReplacementStop.")
 
 with st.sidebar:
     st.header("Données d’entrée")
     tripmods_file = st.file_uploader("TripModifications (JSON / PB / textproto)", type=["json", "pb", "pbf", "bin", "txt"])
     gtfs_file = st.file_uploader("GTFS (.zip)", type=["zip"])
-    decode_mode = st.selectbox("Décodage polylines", ["Auto (recommandé)", "Précision 1e-5", "Précision 1e-6"], index=0)
+    # Labo polyline (hors analyse)
+    st.markdown("---")
+    st.subheader("🧪 Labo polyline (optionnel)")
+    s = st.text_area("Colle une encoded_polyline (pour visualiser, hors analyse TripMods).", height=100)
+    decode_mode = st.selectbox("Décodage (labo)", ["Auto", "1e-5", "1e-6"], index=0)
+    if st.button("Tracer la polyline (labo)"):
+        mode = {"Auto": "auto", "1e-5": "p5", "1e-6": "p6"}[decode_mode]
+        pts = decode_polyline(s, mode=mode)
+        st.write(f"Points décodés : {len(pts)}")
+        chart = build_chart_for_polyline(pts, show_index_labels=True)
+        if chart is not None:
+            st.altair_chart(chart, use_container_width=True)
+        if pts:
+            st.dataframe(pd.DataFrame(pts, columns=["lat", "lon"]).head(50), width="stretch")
+
+    st.markdown("---")
     dump_first = st.checkbox("Afficher le 1er trip_mod normalisé", value=False)
     run_btn = st.button("Analyser", type="primary")
 
-decode_flag = {"Auto (recommandé)": "auto", "Précision 1e-5": "p5", "Précision 1e-6": "p6"}[decode_mode]
-
-# Laboratoire polyline (diagnostic rapide)
-with st.expander("🧪 Laboratoire polyline (tester une chaîne à part)"):
-    s = st.text_area("Colle ici une encoded_polyline (copiée de ton outil Google).", height=100)
-    if st.button("Décoder la chaîne de test"):
-        pts = decode_polyline(s, mode=decode_flag)
-        st.write(f"Points décodés : {len(pts)}")
-        if pts:
-            chart = build_chart_for_polyline(pts, shape_id="(test)", show_index_labels=True)
-            if chart is not None:
-                st.altair_chart(chart, use_container_width=True)
-            st.dataframe(pd.DataFrame(pts, columns=["lat", "lon"]).head(50), width="stretch")
-
 if run_btn:
     if not tripmods_file or not gtfs_file:
-        st.error("Merci de sélectionner **TripModifications** (JSON/PB/textproto) **et** **GTFS** (.zip).")
+        st.error("Merci de sélectionner **TripModifications** et **GTFS** (.zip).")
         st.stop()
 
-    # 1) TripMods → parse + shapes
+    # 1) TripMods → parsing (shapes ignorés)
     with st.spinner("Parsing TripModifications…"):
         try:
-            ents, feed_json, rt_shapes = load_tripmods_bytes(tripmods_file.getvalue(), decode_mode=decode_flag)
+            ents, feed_json = load_tripmods_bytes(tripmods_file.getvalue())
         except Exception as ex:
             st.exception(ex); st.stop()
 
-    needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
+    needed_trip_ids = compute_needed_trip_ids(ents)
 
     # 2) GTFS filtré
     with st.spinner("Chargement GTFS (filtré)…"):
         try:
-            gtfs = load_gtfs_zip_filtered_bytes(gtfs_file.getvalue(), needed_trip_ids, needed_stop_ids)
+            gtfs = load_gtfs_zip_filtered_bytes(gtfs_file.getvalue(), needed_trip_ids)
         except Exception as ex:
             st.exception(ex); st.stop()
 
-    # --- KPI (incl. shapes dans le feed) ---
-    reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
-    total_shapes = len(rt_shapes.shapes)
+    st.success(f"TripModifications : **{len(ents)} entités**")
+    st.info(f"Filtrage GTFS → trips requis: {len(needed_trip_ids):,}")
 
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    # 3) Analyse
+    with st.spinner("Analyse en cours…"):
+        reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
+
+    # KPIs (sans ReplacementStop ni shapes)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Entités", totals["total_entities"])
     c2.metric("trip_ids sélectionnés", totals["total_trip_ids"])
     c3.metric("modifications", totals["total_modifications"])
     c4.metric("trip_ids manquants", totals["missing_trip_ids"])
     c5.metric("selectors non résolus", totals["invalid_selectors"])
-    c6.metric("repl. stops inconnus GTFS", totals["unknown_replacement_stops"])
-    c7.metric("Shapes dans le feed", total_shapes)
 
-    # Infos filtrage et comptages
-    st.info(f"Filtrage GTFS → trips requis: {len(needed_trip_ids):,} · stops requis: {len(needed_stop_ids):,} · shapes disponibles: {total_shapes:,}")
-    st.success(f"GTFS filtré : **{len(gtfs.trips):,} trips conservés**, "
-               f"**{sum(len(v) for v in gtfs.stop_times.values()):,} stop_times**, "
-               f"**{len(gtfs.stops_present):,} stops présents**")
-    st.success(f"TripModifications : **{len(ents)} entités**")
+    # Synthèse par entité
+    table = [{
+        "entity_id": r.entity_id,
+        "trip_ids (sélectionnés)": r.total_selected_trip_ids,
+        "modifications": r.modification_count,
+        "service_dates": ", ".join(r.service_dates),
+    } for r in reports]
+    st.subheader("Synthèse par entité")
+    st.dataframe(table, width="stretch", height=360)
 
     if dump_first and ents:
         with st.expander("Aperçu du 1er trip_mod (normalisé)"):
@@ -828,26 +635,15 @@ if run_btn:
         with st.expander("Aperçu brut du feed JSON (après normalisation camel→snake)"):
             st.json(feed_json)
 
-    # Synthèse par entité
-    table = [{
-        "entity_id": r.entity_id,
-        "trip_ids (sélectionnés)": r.total_selected_trip_ids,
-        "modifications": r.modification_count,
-        "service_dates": ", ".join(r.service_dates),
-        "repl_stops inconnus": ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else ""
-    } for r in reports]
-    st.subheader("Synthèse par entité")
-    st.dataframe(table, width="stretch", height=360)
-
-    # Détails + tracé par entité
+    # 4) Détails (par entité) — colonnes d'anomalies "TripMods only"
     st.subheader("Détails")
     for r in reports[:200]:
         with st.expander(f"Entité {r.entity_id} — {r.total_selected_trip_ids} trips — {r.modification_count} modifications"):
             st.write("**Dates** :", ", ".join(r.service_dates) if r.service_dates else "—")
-            st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
-                     ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
 
-            # Rattache l'objet entité pour récupérer les shape_id
+            # Prépare le tableau détail
+            # NB: pas de 'shape dispo / pts polyline / replacement_stops', etc.
+            #     on garde 'shape_id (trip)' comme info mais sans analyse de la forme
             ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
             shape_ids_in_entity = []
             if ent_obj:
@@ -857,24 +653,17 @@ if run_btn:
             shape_ids_set = set(shape_ids_in_entity)
             mixed_shapes = len([sid for sid in shape_ids_set if sid]) > 1
 
-            # Comptage duplications de trip dans l'entité
+            # duplications de trip dans l'entité
             trip_counts: Dict[str, int] = {}
             if ent_obj:
                 for s in ent_obj.selected_trips:
                     for tid in s.trip_ids:
                         trip_counts[tid] = trip_counts.get(tid, 0) + 1
 
-            # Shape utilisé pour le tracé : premier shape_id de l'entité présent dans rt_shapes
-            shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
-            st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
-
-            # Détails par trip (anomalies incluses)
             detail_rows = []
             for t in r.trips:
                 st_list = gtfs.stop_times.get(t.trip_id, [])
                 stop_times_count = len(st_list)
-
-                # shape_id associé à CE trip (dans le contexte entité)
                 trip_shape_id = None
                 if ent_obj:
                     for s in ent_obj.selected_trips:
@@ -884,15 +673,6 @@ if run_btn:
                 if not trip_shape_id and shape_ids_in_entity:
                     trip_shape_id = shape_ids_in_entity[0]
 
-                poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
-                poly_points = len(poly)
-
-                def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
-                    if not coords or len(coords) < 2: return True
-                    lats = [la for la,_ in coords]; lons = [lo for _,lo in coords]
-                    return (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4
-
-                poly_anormal = _is_poly_anormal(poly)
                 selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
                 ordre_ok = ""
                 ecart_seq = ""
@@ -904,43 +684,27 @@ if run_btn:
                 detail_rows.append({
                     "trip_id": t.trip_id,
                     "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
+                    "shape_id (trip)": trip_shape_id or "",
                     "start_seq": t.start_seq if t.start_seq is not None else "",
                     "end_seq": t.end_seq if t.end_seq is not None else "",
                     "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
-                    "notes": "; ".join(t.notes) if t.notes else "",
-                    # Anomalies / diagnostics
-                    "shape_id (trip)": trip_shape_id or "",
-                    "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
-                    "pts polyline": poly_points,
-                    "polyline anormale": "oui" if poly_anormal else "non",
                     "stop_times (nb)": stop_times_count,
                     "ordre start<=end": ordre_ok,
                     "écart seq": ecart_seq,
                     "selectors incomplets": "oui" if selectors_incomplets else "non",
                     "trip en double (entité)": "oui" if duplicate_trip else "non",
                     "mixed shapes (entité)": "oui" if mixed_shapes else "non",
-                    "repl_stops inconnus (entité)": len(r.replacement_stops_unknown_in_gtfs)
+                    "notes": "; ".join(t.notes) if t.notes else "",
                 })
 
-            st.dataframe(detail_rows, width="stretch", height=260)
+            st.dataframe(detail_rows, width="stretch", height=280)
 
-            # Tracé (si shape dispo)
-            if shape_id_for_plot:
-                poly = rt_shapes.shapes.get(shape_id_for_plot, [])
-                chart = build_chart_for_polyline(poly, shape_id=shape_id_for_plot, show_index_labels=False)
-                if chart is not None:
-                    st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.info("Polyline vide ou invalide pour cette entité.")
-            else:
-                st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
-
-    # Export JSON
-    report_json = {"totals": totals, "total_shapes": total_shapes, "entities": [asdict(r) for r in reports]}
+    # Export JSON (résultats)
+    report_json = {"totals": totals, "entities": [asdict(r) for r in reports]}
     st.download_button("📥 Télécharger le rapport JSON",
                        data=json.dumps(report_json, ensure_ascii=False, indent=2),
                        file_name="rapport_tripmods.json", mime="application/json")
 
 else:
-    st.info("Charge un TripModifications (JSON / PB / textproto) puis un GTFS (.zip), choisis la précision de décodage, et clique **Analyser**.")
-    st.caption("Astuce : si ta polyligne vient d’un JSON, elle doit être « déséchappée » (retrait des \\ et \\n).")
+    st.info("Charge un TripModifications (JSON / PB / textproto) puis un GTFS (.zip), et clique **Analyser**.")
+    st.caption("Seules les entités 'trip_modifications' sont prises en compte ; pas d'analyse des shapes ni des ReplacementStop.")
