@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pandas as pd
 import folium
-from streamlit_folium import st_folium
+import streamlit.components.v1 as components
 
 # --- Version de schéma (invalide cache data si on change la structure de sortie) ---
-SCHEMA_VERSION = "2025-10-18-resource-data-split-v1"
+SCHEMA_VERSION = "2025-10-18-resource-data-split-v2-center-on-trace"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -665,7 +665,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
         ))
     return reports, totals
 
-# 8) Folium — centrage sûr + arrêts temporaires orange
+# 8) Folium — centrage STRICT sur le tracé + arrêts temporaires en orange (sans impact emprise)
 def build_folium_map_for_polyline(
     poly: List[Tuple[float, float]],
     shape_id: Optional[str] = None,
@@ -674,9 +674,9 @@ def build_folium_map_for_polyline(
     zoom_start: int = 12
 ):
     def _valid_ll(la, lo) -> bool:
-        return (la is not None and lo is not None and
-                -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0 and
-                not (abs(la) < 1e-8 and abs(lo) < 1e-8))  # évite (0,0)
+        return (la is not None and lo is not None
+                and -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0
+                and not (abs(la) < 1e-8 and abs(lo) < 1e-8))  # évite (0,0)
 
     if not poly or len(poly) < 2:
         return None
@@ -685,7 +685,7 @@ def build_folium_map_for_polyline(
         return None
 
     m = folium.Map(
-        location=montreal_center,
+        location=montreal_center,  # sera remplacé par fit_bounds
         zoom_start=zoom_start,
         tiles="OpenStreetMap",
         control_scale=True,
@@ -704,23 +704,8 @@ def build_folium_map_for_polyline(
     folium.CircleMarker(latlons_poly[-1], radius=6, color="red",
                         fill=True, fill_opacity=0.9, tooltip="Arrivée").add_to(m)
 
-    lats = [la for la, _ in latlons_poly]
-    lons = [lo for _, lo in latlons_poly]
-    min_lat, max_lat = min(lats), max(lats)
-    min_lon, max_lon = min(lons), max(lons)
-    span_lat = max(max_lat - min_lat, 1e-5)
-    span_lon = max(max_lon - min_lon, 1e-5)
-    pad_lat = max(span_lat * 0.15, 0.002)
-    pad_lon = max(span_lon * 0.15, 0.002)
-
-    bounds_pts: List[Tuple[float, float]] = latlons_poly.copy()
-
+    # Arrêts temporaires visibles mais sans impact sur l’emprise
     if replacement_stop_points:
-        min_lat_ext = min_lat - pad_lat
-        max_lat_ext = max_lat + pad_lat
-        min_lon_ext = min_lon - pad_lon
-        max_lon_ext = max_lon + pad_lon
-
         for la, lo, lab in replacement_stop_points:
             if _valid_ll(la, lo):
                 folium.CircleMarker(
@@ -731,18 +716,24 @@ def build_folium_map_for_polyline(
                     fill_opacity=0.95,
                     tooltip=lab or "Arrêt temporaire"
                 ).add_to(m)
-                if (min_lat_ext <= la <= max_lat_ext) and (min_lon_ext <= lo <= max_lon_ext):
-                    bounds_pts.append((la, lo))
 
-    if len(bounds_pts) == 1:
-        m.location = bounds_pts[0]
-        m.options.update({"zoom": 15})
-    else:
-        m.fit_bounds(bounds_pts, padding=(30, 30))
+    # Emprise STRICTE sur le tracé (min/max + padding)
+    lats = [la for la, _ in latlons_poly]
+    lons = [lo for _, lo in latlons_poly]
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+    span_lat = max(max_lat - min_lat, 1e-5)
+    span_lon = max(max_lon - min_lon, 1e-5)
+    pad_lat = max(span_lat * 0.15, 0.002)
+    pad_lon = max(span_lon * 0.15, 0.002)
+
+    sw = (min_lat - pad_lat, min_lon - pad_lon)
+    ne = (max_lat + pad_lat, max_lon + pad_lon)
+    m.fit_bounds([sw, ne], padding=(30, 30))
 
     return m
 
-# 9) CACHE — split resource/data (évite la sérialisation d’objets lourds)
+# 9) CACHE — split resource/data + carte HTML en cache resource
 def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
@@ -756,23 +747,41 @@ def resource_load_gtfs(gtfs_bytes: bytes, needed_trip_ids_sorted: Tuple[str, ...
     gtfs = load_gtfs_zip_filtered_bytes(gtfs_bytes, set(needed_trip_ids_sorted), set(needed_stop_ids_sorted))
     return gtfs
 
+@st.cache_resource(show_spinner=False)
+def resource_build_map_html(
+    shape_id_key: str,
+    poly_key: Tuple[Tuple[float, float], ...],
+    stops_key: Tuple[Tuple[float, float, str], ...],
+    schema: str
+) -> str:
+    """
+    Construit la carte Folium et renvoie **l'HTML** (string) mis en cache.
+    Les clés (poly_key, stops_key) sont des tuples hashables.
+    """
+    poly = [(la, lo) for (la, lo) in poly_key]
+    stops = [(la, lo, lab) for (la, lo, lab) in stops_key]
+    fmap = build_folium_map_for_polyline(poly, shape_id=shape_id_key, replacement_stop_points=stops)
+    if fmap is None:
+        return "<div>Carte indisponible</div>"
+    return fmap.get_root().render()
+
 @st.cache_data(show_spinner=True, ttl=86400, max_entries=32, hash_funcs={bytes: _hash_bytes})
 def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, schema: str) -> Dict[str, Any]:
-    # 1) Parse TripMods (resource cache)
+    # 1) Parse TripMods
     ents, feed_json, rt_shapes = resource_parse_tripmods(tripmods_bytes, decode_flag)
     needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
     tid_sorted = tuple(sorted(needed_trip_ids))
     sid_sorted = tuple(sorted(needed_stop_ids))
 
-    # 2) GTFS filtré (resource cache)
+    # 2) GTFS filtré
     gtfs = resource_load_gtfs(gtfs_bytes, tid_sorted, sid_sorted)
 
-    # 3) Analyse (retours dataclasses → convertis en dicts)
+    # 3) Analyse (dataclasses → dicts)
     reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
     reports_plain = [asdict(r) for r in reports]
     total_shapes = len(rt_shapes.shapes)
 
-    # 4) Prépare les vues "Détails" (tout JSON‑compatible)
+    # 4) Prépare les vues “Détails” (tout JSON‑compatible)
     details_tables_by_entity: Dict[str, List[Dict[str, Any]]] = {}
     temp_stops_points_by_entity: Dict[str, List[List[Any]]] = {}
     shape_for_plot_by_entity: Dict[str, Optional[str]] = {}
@@ -794,15 +803,14 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
         shape_for_plot_by_entity[ent_id] = shape_id_for_plot
 
-        # comptage trips dupliqués
+        # Comptage dupliqués
         trip_counts: Dict[str, int] = {}
         for s in ent_obj.selected_trips:
             for tid in s.trip_ids:
                 trip_counts[tid] = trip_counts.get(tid, 0) + 1
-
         mixed_shapes = len({sid for sid in shape_ids_in_entity if sid}) > 1
 
-        # tableau diagnostics
+        # Tableau diagnostics
         detail_rows: List[Dict[str, Any]] = []
         for t in r.trips:
             st_list = gtfs.stop_times.get(t.trip_id, [])
@@ -885,11 +893,11 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         "gtfs_kpi": gtfs_kpi,
     }
 
-# 10) UI — formulaire + session_state (stable)
+# 10) UI — formulaire + session_state (stable, pas de rafraîchissement de carte)
 st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Carte Folium")
 st.caption(
     "Polylines nettoyées (déséchappage léger), décodées (Auto/1e‑5/1e‑6) et affichées sur une carte Folium (fond OSM). "
-    "Analyse et diagnostics pré‑calculés et mis en cache (moins de rafraîchissements)."
+    "Analyse et diagnostics pré‑calculés et mis en cache. La carte est centrée strictement sur le tracé et mise en cache HTML."
 )
 
 with st.sidebar:
@@ -969,11 +977,10 @@ table = [{
 st.subheader("Synthèse par entité")
 st.dataframe(table, width="stretch", height=360)
 
-# --- Détails + tableau + carte par entité ---
+# --- Détails + tableau + carte par entité (carte HTML en cache resource, sans rafraîchissement) ---
 st.subheader("Détails")
 for r in reports_plain[:200]:
     ent_id = r["entity_id"]
-    # Afficher uniquement si l'entité a des modifications (déjà filtré côté parse/analyse normalement)
     if r["modification_count"] <= 0:
         continue
 
@@ -989,23 +996,20 @@ for r in reports_plain[:200]:
         else:
             st.info("Aucune ligne de diagnostic pour cette entité.")
 
-        # Carte (shape + arrêts orange pré-calculés)
+        # Carte (shape + arrêts orange pré-calculés) — HTML en cache
         shape_id_for_plot = shape_for_plot_by_entity.get(ent_id)
         st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
         if shape_id_for_plot:
             coords_list = shapes_plain.get(shape_id_for_plot, [])
-            poly = [(la, lo) for la, lo in coords_list]  # conversion list->tuple
+            poly = [(float(la), float(lo)) for la, lo in coords_list]
             if poly and len(poly) >= 2:
-                # points orange (liste [lat, lon, label] -> tuples)
+                # clés hashables et compactes
+                poly_key = tuple((round(la, 6), round(lo, 6)) for la, lo in poly)
                 tmp_pts = temp_stops_points_by_entity.get(ent_id, [])
-                tmp_pts_tuples = [(p[0], p[1], p[2]) for p in tmp_pts] if tmp_pts else []
-                fmap = build_folium_map_for_polyline(
-                    poly,
-                    shape_id=shape_id_for_plot,
-                    replacement_stop_points=tmp_pts_tuples
-                )
-                if fmap is not None:
-                    st_folium(fmap, height=440, width=None, key=f"map_{ent_id}")
+                stops_key = tuple((round(p[0], 6), round(p[1], 6), str(p[2])) for p in tmp_pts)
+                # HTML de la carte en cache resource
+                map_html = resource_build_map_html(shape_id_for_plot or "", poly_key, stops_key, SCHEMA_VERSION)
+                components.html(map_html, height=440, scrolling=False)
             else:
                 st.info("Polyline vide ou invalide pour cette entité.")
         else:
