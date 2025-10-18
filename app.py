@@ -922,4 +922,4 @@ report_json = {"totals": totals, "total_shapes": total_shapes, "entities": [asdi
 st.download_button("📥 Télécharger le rapport JSON",
                    data=json.dumps(report_json, ensure_ascii=False, indent=2),
                    file_name="rapport_tripmods.json", mime="application/json")
-``
+
