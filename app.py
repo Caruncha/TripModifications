@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import streamlit as st
@@ -12,7 +11,6 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple, Set
 from pathlib import Path
 import pandas as pd
-
 
 # Carte
 import folium
@@ -104,7 +102,7 @@ class EntityReport:
 class RtShapes:
     shapes: Dict[str, List[Tuple[float, float]]]  # shape_id -> [(lat, lon), ...]
 
-# 3) Décodage polyline (nettoyage SANS unicode_escape) + Auto/5/6 + fallback
+# 3) Décodage polyline
 def _sanitize_polyline(s: str) -> str:
     if not s:
         return s
@@ -181,7 +179,7 @@ def decode_polyline(encoded: str, mode: str = "auto") -> List[Tuple[float, float
 def _detect_tripmods_format_bytes(b: bytes) -> str:
     head = (b[:4096] or b'')
     hs = head.lstrip()
-    if hs.startswith(b'{') or hs.startswith(b'['):   # <-- corrigé ici
+    if hs.startswith(b'{') or hs.startswith(b'['):   # corrigé
         return 'json'
     try:
         txt = head.decode('utf-8', 'ignore')
@@ -492,7 +490,6 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> Tuple[List[TripModEntity
                     )
                 continue
             continue
-
         if in_shape:
             if line.startswith('shape_id '):
                 shape_buf['shape_id'] = line[len('shape_id '):].strip()
@@ -682,7 +679,7 @@ def build_folium_map_for_polyline(
         return None
 
     m = folium.Map(location=montreal_center, zoom_start=zoom_start,
-                   tiles="OpenStreetMap", control_scale=True)
+        tiles="OpenStreetMap", control_scale=True)
 
     latlons = [(la, lo) for la, lo in poly]
     folium.PolyLine(
@@ -807,7 +804,7 @@ table = [{
 st.subheader("Synthèse par entité")
 st.dataframe(table, width="stretch", height=360)
 
-# --- Détails + tracé par entité (AFFICHER UNIQUEMENT si trip_modifications présent) ---
+# --- Détails + carte par entité ---
 st.subheader("Détails")
 for r in reports[:200]:
     ent_obj = next((e for e in ents if e.entity_id == r.entity_id), None)
@@ -819,12 +816,12 @@ for r in reports[:200]:
         st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
                  ", ".join(r.replacement_stops_unknown_in_gtfs) if r.replacement_stops_unknown_in_gtfs else "—")
 
-        # Liste des shape_id déclarés côté selected_trips
+        # Shape à tracer
         shape_ids_in_entity = [s.shape_id for s in ent_obj.selected_trips if s.shape_id]
         shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
         st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
 
-        # Construit la liste des arrêts temporaires (remplacement_stops) avec coordonnées (si dispo)
+        # Points des arrêts temporaires (orange) si coords dispo
         tmp_stop_points: List[Tuple[float, float, str]] = []
         tmp_stop_ids_seen: Set[str] = set()
         for m in ent_obj.modifications:
@@ -838,7 +835,7 @@ for r in reports[:200]:
                     tmp_stop_points.append((info["lat"], info["lon"], label))
                     tmp_stop_ids_seen.add(sid)
 
-        # Tracé carte (Folium)
+        # Carte
         if shape_id_for_plot:
             poly = rt_shapes.shapes.get(shape_id_for_plot, [])
             if poly and len(poly) >= 2:
@@ -848,7 +845,6 @@ for r in reports[:200]:
                     replacement_stop_points=tmp_stop_points
                 )
                 if fmap is not None:
-                    # PATCH 2 : clé unique par entité
                     st_folium(fmap, height=440, width=None, key=f"map_{r.entity_id}")
             else:
                 st.info("Polyline vide ou invalide pour cette entité.")
