@@ -14,9 +14,9 @@ from pathlib import Path
 import pandas as pd
 import folium
 import streamlit.components.v1 as components
-# --- Version de schéma (invalide cache data si on change la structure de sortie) ---
-# Bump pour inclure le tracé originel vert et stops rose
-SCHEMA_VERSION = "2025-10-18-resource-data-split-v4-green-original-pink-stops"
+
+# --- Version de schéma (invalide caches et cartes quand la structure/version change) ---
+SCHEMA_VERSION = "2025-10-18-resource-data-split-v5-green-original-pink-stops-fix"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -719,7 +719,7 @@ def build_folium_map_for_polyline(
         return None
 
     m = folium.Map(
-        location=montreal_center,  # sera remplacé par fit_bounds
+        location=montreal_center,
         zoom_start=zoom_start,
         tiles="OpenStreetMap",
         control_scale=True,
@@ -739,7 +739,7 @@ def build_folium_map_for_polyline(
     folium.CircleMarker(latlons_poly[-1], radius=6, color="red",
                         fill=True, fill_opacity=0.9, tooltip="Arrivée du détour").add_to(m)
 
-    # Tracé originel (VERT) — n'influence PAS l'emprise
+    # Tracé originel (VERT)
     if original_poly and len(original_poly) >= 2:
         latlons_orig = [(la, lo) for la, lo in original_poly if _valid_ll(la, lo)]
         if len(latlons_orig) >= 2:
@@ -749,19 +749,18 @@ def build_folium_map_for_polyline(
                 weight=4,
                 opacity=0.85,
                 tooltip="Tracé originel (shapes.txt)"
-                # dash_array="10,6"  # désactivé, remets si tu veux le vert en pointillé
             ).add_to(m)
 
-    # Replacement stops (ROSE) — n'influence PAS l'emprise
+    # Replacement stops (ROSE)
     if replacement_stop_points:
         for la, lo, lab in replacement_stop_points:
             if _valid_ll(la, lo):
                 folium.CircleMarker(
                     location=(la, lo),
                     radius=7,
-                    color="#ff69b4",          # contour rose
+                    color="#ff69b4",
                     fill=True,
-                    fill_color="#ff69b4",     # remplissage rose
+                    fill_color="#ff69b4",
                     fill_opacity=0.95,
                     weight=2,
                     tooltip=lab or "Arrêt de remplacement"
@@ -788,13 +787,18 @@ def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 @st.cache_resource(show_spinner=True)
-def resource_parse_tripmods(tripmods_bytes: bytes, decode_flag: str):
+def resource_parse_tripmods(tripmods_bytes: bytes, decode_flag: str, schema: str):
+    # schema param → invalidation volontaire à la mise à jour
     ents, feed_json, rt_shapes = load_tripmods_bytes(tripmods_bytes, decode_mode=decode_flag)
     return ents, feed_json, rt_shapes
 
 @st.cache_resource(show_spinner=True)
-def resource_load_gtfs(gtfs_bytes: bytes, needed_trip_ids_sorted: Tuple[str, ...], needed_stop_ids_sorted: Tuple[str, ...]):
+def resource_load_gtfs(gtfs_bytes: bytes, needed_trip_ids_sorted: Tuple[str, ...], needed_stop_ids_sorted: Tuple[str, ...], schema: str):
+    # schema param → invalidation volontaire à la mise à jour
     gtfs = load_gtfs_zip_filtered_bytes(gtfs_bytes, set(needed_trip_ids_sorted), set(needed_stop_ids_sorted))
+    # Rétro-compat : s’assure que shapes_points existe même si un ancien objet restait en cache
+    if not hasattr(gtfs, "shapes_points") or gtfs.shapes_points is None:
+        gtfs.shapes_points = {}
     return gtfs
 
 @st.cache_resource(show_spinner=False)
@@ -807,7 +811,8 @@ def resource_build_map_html(
 ) -> str:
     """
     Construit la carte Folium et renvoie **l'HTML** (string) mis en cache.
-    Les clés (...) sont des tuples hashables.
+    Les clés (poly_key, stops_key, original_poly_key) sont des tuples hashables.
+    Le paramètre 'schema' force l'invalidation si on change la logique d'affichage.
     """
     poly = [(la, lo) for (la, lo) in poly_key]
     stops = [(la, lo, lab) for (la, lo, lab) in stops_key]
@@ -821,14 +826,14 @@ def resource_build_map_html(
 
 @st.cache_data(show_spinner=True, ttl=86400, max_entries=32, hash_funcs={bytes: _hash_bytes})
 def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, schema: str) -> Dict[str, Any]:
-    # 1) Parse TripMods
-    ents, feed_json, rt_shapes = resource_parse_tripmods(tripmods_bytes, decode_flag)
+    # 1) Parse TripMods (resource)
+    ents, feed_json, rt_shapes = resource_parse_tripmods(tripmods_bytes, decode_flag, schema)
     needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
     tid_sorted = tuple(sorted(needed_trip_ids))
     sid_sorted = tuple(sorted(needed_stop_ids))
 
-    # 2) GTFS filtré
-    gtfs = resource_load_gtfs(gtfs_bytes, tid_sorted, sid_sorted)
+    # 2) GTFS filtré (resource)
+    gtfs = resource_load_gtfs(gtfs_bytes, tid_sorted, sid_sorted, schema)
 
     # 3) Analyse (dataclasses → dicts)
     reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
@@ -839,7 +844,6 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
     details_tables_by_entity: Dict[str, List[Dict[str, Any]]] = {}
     temp_stops_points_by_entity: Dict[str, List[List[Any]]] = {}
     shape_for_plot_by_entity: Dict[str, Optional[str]] = {}
-    # + Tracé originel par entité (points lat/lon) + shape_id originel
     original_poly_by_entity: Dict[str, List[List[float]]] = {}
     original_shape_id_by_entity: Dict[str, Optional[str]] = {}
 
@@ -849,6 +853,7 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         return (max(lats)-min(lats) + max(lons)-min(lons)) < 1e-4
 
     stops_info = getattr(gtfs, "stops_info", {}) or {}
+    shapes_pts = getattr(gtfs, "shapes_points", {}) or {}  # <-- fallback sûr
 
     for r in reports:
         ent_id = r.entity_id
@@ -868,13 +873,13 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         mixed_shapes = len({sid for sid in shape_ids_in_entity if sid}) > 1
 
         detail_rows: List[Dict[str, Any]] = []
-        # Sélection d'un trip pour récupérer son tracé originel (shapes.txt)
         chosen_original_shape_id: Optional[str] = None
+
         for t in r.trips:
             st_list = gtfs.stop_times.get(t.trip_id, [])
             stop_times_count = len(st_list)
 
-            # shape_id associé à ce trip (dans le contexte entité, pour le détour côté RT)
+            # shape_id (RT) côté entité
             trip_shape_id = None
             for s in ent_obj.selected_trips:
                 if t.trip_id in s.trip_ids and s.shape_id:
@@ -883,7 +888,6 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
             if not trip_shape_id and shape_ids_in_entity:
                 trip_shape_id = shape_ids_in_entity[0]
 
-            # Tracé détour (RT) pour diag
             poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
             poly_points = len(poly)
             poly_anormal = _is_poly_anormal(poly)
@@ -915,16 +919,16 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
                 "mixed shapes (entité)": "oui" if mixed_shapes else "non",
             })
 
-            # --- Choix du trip pour l'ORIGINAL --- (une seule fois)
+            # Choix d'un trip pour l'ORIGINAL (via trips.txt -> shape_id -> shapes.txt)
             if chosen_original_shape_id is None and t.exists_in_gtfs:
                 trip_row = gtfs.trips.get(t.trip_id, {})
                 static_sid = (trip_row.get('shape_id') or '').strip()
-                if static_sid and static_sid in gtfs.shapes_points and len(gtfs.shapes_points[static_sid]) >= 2:
+                if static_sid and static_sid in shapes_pts and len(shapes_pts.get(static_sid, [])) >= 2:
                     chosen_original_shape_id = static_sid
 
         details_tables_by_entity[ent_id] = detail_rows
 
-        # Arrêts de remplacement (ROSE)
+        # Replacement stops (ROSE)
         tmp_points: List[List[Any]] = []
         seen: Set[str] = set()
         for m in ent_obj.modifications:
@@ -938,9 +942,9 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
                     seen.add(sid)
         temp_stops_points_by_entity[ent_id] = tmp_points
 
-        # Tracé originel (shapes.txt) pour l'entité
+        # Tracé originel (shapes.txt)
         if chosen_original_shape_id:
-            orig = gtfs.shapes_points.get(chosen_original_shape_id, [])
+            orig = shapes_pts.get(chosen_original_shape_id, [])
             original_poly_by_entity[ent_id] = [[la, lo] for (la, lo) in orig]
             original_shape_id_by_entity[ent_id] = chosen_original_shape_id
         else:
@@ -1096,7 +1100,6 @@ for r in reports_plain[:200]:
                 poly_key = tuple((round(la, 6), round(lo, 6)) for la, lo in poly)
                 tmp_pts = temp_stops_points_by_entity.get(ent_id, [])
                 stops_key = tuple((round(p[0], 6), round(p[1], 6), str(p[2])) for p in tmp_pts)
-                # original poly (peut être vide)
                 orig_list = original_poly_by_entity.get(ent_id, [])
                 orig_poly = [(float(la), float(lo)) for la, lo in orig_list]
                 original_poly_key = tuple((round(la, 6), round(lo, 6)) for la, lo in orig_poly) if orig_poly else tuple()
@@ -1108,7 +1111,7 @@ for r in reports_plain[:200]:
         else:
             st.info("Aucune polyline 'encoded_polyline' (détour RT) disponible pour cette entité.")
 
-# Export JSON (rapports déjà en dict)
+# Export JSON (raports déjà en dict)
 export_json = {
     "schema_version": SCHEMA_VERSION,
     "totals": totals,
