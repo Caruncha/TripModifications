@@ -17,6 +17,7 @@ import pandas as pd
 # Carte
 import folium
 from streamlit_folium import st_folium
+
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -180,7 +181,7 @@ def decode_polyline(encoded: str, mode: str = "auto") -> List[Tuple[float, float
 def _detect_tripmods_format_bytes(b: bytes) -> str:
     head = (b[:4096] or b'')
     hs = head.lstrip()
-    if hs.startswith(b'{') or hs.startswith(b'[']):
+    if hs.startswith(b'{') or hs.startswith(b'['):   # <-- corrigé ici
         return 'json'
     try:
         txt = head.decode('utf-8', 'ignore')
@@ -343,7 +344,7 @@ def _lines(b: bytes):
     for raw in b.decode('utf-8', 'ignore').splitlines():
         yield raw.strip()
 
-def parse_textproto_feed(b: bytes, decode_mode: str) -> tuple[List[TripModEntity], RtShapes]:
+def parse_textproto_feed(b: bytes, decode_mode: str) -> Tuple[List[TripModEntity], RtShapes]:
     ents: List[TripModEntity] = []
     shapes: Dict[str, List[Tuple[float, float]]] = {}
 
