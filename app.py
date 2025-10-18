@@ -16,7 +16,8 @@ import folium
 import streamlit.components.v1 as components
 
 # --- Version de schéma (invalide cache data si on change la structure de sortie) ---
-SCHEMA_VERSION = "2025-10-18-resource-data-split-v2-center-on-trace"
+# Bump pour forcer le rafraîchissement des cartes (passage des stops en rose)
+SCHEMA_VERSION = "2025-10-18-resource-data-split-v3-pink-stops"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -665,7 +666,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
         ))
     return reports, totals
 
-# 8) Folium — centrage STRICT sur le tracé + arrêts temporaires en orange (sans impact emprise)
+# 8) Folium — centrage STRICT sur le tracé + replacement stops en ROSE (sans impact emprise)
 def build_folium_map_for_polyline(
     poly: List[Tuple[float, float]],
     shape_id: Optional[str] = None,
@@ -704,17 +705,19 @@ def build_folium_map_for_polyline(
     folium.CircleMarker(latlons_poly[-1], radius=6, color="red",
                         fill=True, fill_opacity=0.9, tooltip="Arrivée").add_to(m)
 
-    # Arrêts temporaires visibles mais sans impact sur l’emprise
+    # Replacement stops (ROSE) visibles mais sans impact sur l’emprise
     if replacement_stop_points:
         for la, lo, lab in replacement_stop_points:
             if _valid_ll(la, lo):
                 folium.CircleMarker(
                     location=(la, lo),
                     radius=7,
-                    color="orange",
+                    color="#ff69b4",          # contour rose
                     fill=True,
+                    fill_color="#ff69b4",     # remplissage rose
                     fill_opacity=0.95,
-                    tooltip=lab or "Arrêt temporaire"
+                    weight=2,
+                    tooltip=lab or "Arrêt temporaire (remplacement)"
                 ).add_to(m)
 
     # Emprise STRICTE sur le tracé (min/max + padding)
@@ -852,7 +855,7 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
             })
         details_tables_by_entity[ent_id] = detail_rows
 
-        # points orange (liste [lat, lon, label])
+        # replacement stops (liste [lat, lon, label]) — en ROSE sur la carte
         tmp_points: List[List[Any]] = []
         seen: Set[str] = set()
         for m in ent_obj.modifications:
@@ -897,7 +900,8 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
 st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Carte Folium")
 st.caption(
     "Polylines nettoyées (déséchappage léger), décodées (Auto/1e‑5/1e‑6) et affichées sur une carte Folium (fond OSM). "
-    "Analyse et diagnostics pré‑calculés et mis en cache. La carte est centrée strictement sur le tracé et mise en cache HTML."
+    "Analyse et diagnostics pré‑calculés et mis en cache. La carte est centrée strictement sur le tracé et mise en cache HTML. "
+    "Les arrêts de remplacement sont affichés en **rose**."
 )
 
 with st.sidebar:
@@ -996,7 +1000,7 @@ for r in reports_plain[:200]:
         else:
             st.info("Aucune ligne de diagnostic pour cette entité.")
 
-        # Carte (shape + arrêts orange pré-calculés) — HTML en cache
+        # Carte (shape + replacement stops en ROSE) — HTML en cache
         shape_id_for_plot = shape_for_plot_by_entity.get(ent_id)
         st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
         if shape_id_for_plot:
