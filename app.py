@@ -6,7 +6,7 @@ st.set_page_config(
     layout="wide"
 )
 
-import json, csv, io, zipfile, sys, re
+import json, csv, io, zipfile, sys, re, hashlib
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple, Set
 from pathlib import Path
@@ -15,6 +15,9 @@ import pandas as pd
 # Carte
 import folium
 from streamlit_folium import st_folium
+
+# --- Version de schéma (pour invalider proprement le cache / session_state) ---
+SCHEMA_VERSION = "2025-10-18-gtfsstopsinfo-v2"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -74,10 +77,11 @@ class TripModEntity:
 
 @dataclass
 class GtfsStatic:
-    trips: Dict[str, Dict[str, str]]
-    stop_times: Dict[str, List[Dict[str, str]]]
-    stops_present: Set[str]
-    stops_info: Dict[str, Dict[str, Any]]   # stop_id -> {"lat": float, "lon": float, "name": str}
+    trips: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    stop_times: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+    stops_present: Set[str] = field(default_factory=set)
+    # stop_id -> {"lat": float, "lon": float, "name": str}
+    stops_info: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 @dataclass
 class TripCheck:
@@ -421,7 +425,6 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> Tuple[List[TripModEntity
             in_tm, in_shape, capturing_poly = True, False, False
             tm_buf = dict(selected_trips=[], service_dates=[], start_times=[], modifications=[])
             continue
-
         if line.startswith('shape'):
             in_tm, in_shape, capturing_poly = False, True, False
             shape_buf = {}
@@ -679,7 +682,7 @@ def build_folium_map_for_polyline(
         return None
 
     m = folium.Map(location=montreal_center, zoom_start=zoom_start,
-        tiles="OpenStreetMap", control_scale=True)
+                   tiles="OpenStreetMap", control_scale=True)
 
     latlons = [(la, lo) for la, lo in poly]
     folium.PolyLine(
@@ -716,9 +719,13 @@ def build_folium_map_for_polyline(
 
     return m
 
-# 9) CACHE des calculs lourds
-@st.cache_data(show_spinner=False)
-def run_analysis_cached(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str):
+# 9) CACHE des calculs lourds (avec hash rapide pour bytes)
+def _hash_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+@st.cache_data(show_spinner=False, hash_funcs={bytes: _hash_bytes})
+def run_analysis_cached(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, schema_version: str):
+    # Le paramètre schema_version force l'invalidation si la structure change
     ents, feed_json, rt_shapes = load_tripmods_bytes(tripmods_bytes, decode_mode=decode_flag)
     needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
     gtfs = load_gtfs_zip_filtered_bytes(gtfs_bytes, needed_trip_ids, needed_stop_ids)
@@ -727,7 +734,8 @@ def run_analysis_cached(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: s
     return dict(
         ents=ents, feed_json=feed_json, rt_shapes=rt_shapes,
         gtfs=gtfs, reports=reports, totals=totals, total_shapes=total_shapes,
-        needed_trip_ids=needed_trip_ids, needed_stop_ids=needed_stop_ids
+        needed_trip_ids=needed_trip_ids, needed_stop_ids=needed_stop_ids,
+        schema_version=schema_version,
     )
 
 # 10) UI — formulaire + session_state (stable)
@@ -754,12 +762,17 @@ if submitted:
     else:
         tripmods_bytes = tripmods_file.getvalue()
         gtfs_bytes = gtfs_file.getvalue()
-        res = run_analysis_cached(tripmods_bytes, gtfs_bytes, decode_flag)
+        res = run_analysis_cached(tripmods_bytes, gtfs_bytes, decode_flag, SCHEMA_VERSION)
         st.session_state["last_results"] = res
-        st.session_state["last_params"] = dict(decode_flag=decode_flag)
+        st.session_state["last_params"] = dict(decode_flag=decode_flag, schema_version=SCHEMA_VERSION)
         st.success("Analyse terminée ✅")
 
+# Récupération des résultats (et vérif de version de schéma)
 res = st.session_state.get("last_results")
+if res and res.get("schema_version") != SCHEMA_VERSION:
+    # Invalide un ancien résultat
+    res = None
+    st.session_state.pop("last_results", None)
 
 if not res:
     st.info("Charge un TripModifications (JSON / PB / textproto) puis un GTFS (.zip), choisis la précision de décodage, et clique **Analyser**.")
@@ -769,6 +782,10 @@ if not res:
 ents = res["ents"]; feed_json = res["feed_json"]; rt_shapes = res["rt_shapes"]
 gtfs = res["gtfs"]; reports = res["reports"]; totals = res["totals"]; total_shapes = res["total_shapes"]
 needed_trip_ids = res["needed_trip_ids"]; needed_stop_ids = res["needed_stop_ids"]
+
+# Sécurité supplémentaire si un ancien objet est en session (évite AttributeError)
+if not hasattr(gtfs, "stops_info") or gtfs.stops_info is None:
+    gtfs.stops_info = {}
 
 # KPIs
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
@@ -824,12 +841,13 @@ for r in reports[:200]:
         # Points des arrêts temporaires (orange) si coords dispo
         tmp_stop_points: List[Tuple[float, float, str]] = []
         tmp_stop_ids_seen: Set[str] = set()
+        stops_info = getattr(gtfs, "stops_info", {}) or {}
         for m in ent_obj.modifications:
             for rs in m.replacement_stops:
                 sid = rs.stop_id
                 if not sid or sid in tmp_stop_ids_seen:
                     continue
-                info = gtfs.stops_info.get(sid)
+                info = stops_info.get(sid)
                 if info and "lat" in info and "lon" in info:
                     label = f"{sid} — {info.get('name') or ''}".strip(" —")
                     tmp_stop_points.append((info["lat"], info["lon"], label))
@@ -852,7 +870,7 @@ for r in reports[:200]:
             st.info("Aucune polyline 'encoded_polyline' disponible pour cette entité.")
 
 # Export JSON
-report_json = {"totals": totals, "total_shapes": total_shapes, "entities": [asdict(r) for r in reports]}
+report_json = {"totals": totals, "total_shapes": total_shapes, "entities": [asdict(r) for r in reports], "schema_version": SCHEMA_VERSION}
 st.download_button("📥 Télécharger le rapport JSON",
                    data=json.dumps(report_json, ensure_ascii=False, indent=2),
                    file_name="rapport_tripmods.json", mime="application/json")
