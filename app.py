@@ -676,39 +676,96 @@ def build_folium_map_for_polyline(
     montreal_center: Tuple[float, float] = (45.5017, -73.5673),
     zoom_start: int = 12
 ):
+    """
+    Construit une carte Folium centrée sur la polyline (détour) et n'ajoute
+    dans l'emprise que les arrêts temporaires "proches" du tracé.
+    - poly : liste de (lat, lon)
+    - replacement_stop_points : liste de (lat, lon, label)
+    """
+
+    def _valid_ll(la, lo) -> bool:
+        return (la is not None and lo is not None and
+                -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0 and
+                not (abs(la) < 1e-8 and abs(lo) < 1e-8))  # évite (0,0)
+
+    # Filtre & prépare la polyline
     if not poly or len(poly) < 2:
         return None
-    m = folium.Map(location=montreal_center, zoom_start=zoom_start,
-                   tiles="OpenStreetMap", control_scale=True)
-    latlons = [(la, lo) for la, lo in poly]
+    latlons_poly = [(la, lo) for la, lo in poly if _valid_ll(la, lo)]
+    if len(latlons_poly) < 2:
+        return None
+
+    # Carte de base (min_zoom pour éviter la vue monde)
+    m = folium.Map(
+        location=montreal_center,
+        zoom_start=zoom_start,
+        tiles="OpenStreetMap",
+        control_scale=True,
+        min_zoom=8  # <-- garde un zoom minimum décent
+    )
+
+    # Trace la polyline (le détour)
     folium.PolyLine(
-        locations=latlons,
+        locations=latlons_poly,
         color="#1f77b4",
         weight=5,
         opacity=0.9,
         tooltip=f"shape_id: {shape_id or 'n/a'}",
     ).add_to(m)
-    # Départ / Arrivée
-    folium.CircleMarker(latlons[0], radius=6, color="green",
+
+    # Marqueurs départ / arrivée
+    folium.CircleMarker(latlons_poly[0], radius=6, color="green",
                         fill=True, fill_opacity=0.9, tooltip="Départ").add_to(m)
-    folium.CircleMarker(latlons[-1], radius=6, color="red",
+    folium.CircleMarker(latlons_poly[-1], radius=6, color="red",
                         fill=True, fill_opacity=0.9, tooltip="Arrivée").add_to(m)
-    # Arrêts temporaires (orange)
-    bounds_pts = latlons.copy()
+
+    # --- Calcule l'emprise sur la polyline (centrage "sûr") ---
+    lats = [la for la, _ in latlons_poly]
+    lons = [lo for _, lo in latlons_poly]
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+    span_lat = max(max_lat - min_lat, 1e-5)
+    span_lon = max(max_lon - min_lon, 1e-5)
+
+    # Padding de base autour du tracé
+    pad_lat = max(span_lat * 0.15, 0.002)
+    pad_lon = max(span_lon * 0.15, 0.002)
+
+    # On commence par l'emprise de la polyline uniquement
+    bounds_pts: List[Tuple[float, float]] = latlons_poly.copy()
+
+    # Ajoute *uniquement* les arrêts temporaires à proximité du tracé
+    # (dans une "boîte" élargie), pour éviter un point aberrant qui provoque la vue monde.
     if replacement_stop_points:
-        for la, lo, lab in replacement_stop_points:
-            folium.CircleMarker(
-                location=(la, lo),
-                radius=7,
-                color="orange",
-                fill=True,
-                fill_opacity=0.95,
-                tooltip=lab or "Arrêt temporaire"
-            ).add_to(m)
-            bounds_pts.append((la, lo))
-    # Emprise finale
-    if bounds_pts:
-        m.fit_bounds(bounds_pts)
+        min_lat_ext = min_lat - pad_lat
+        max_lat_ext = max_lat + pad_lat
+        min_lon_ext = min_lon - pad_lon
+        max_lon_ext = max_lon + pad_lon
+
+        for la, lo, _lab in replacement_stop_points:
+            if _valid_ll(la, lo):
+                if (min_lat_ext <= la <= max_lat_ext) and (min_lon_ext <= lo <= max_lon_ext):
+                    bounds_pts.append((la, lo))
+                # Sinon: on affiche quand même le point (marqueur), mais on ne l'utilise pas pour le centrage
+
+                # Ajout visuel du point orange (que le point soit dans l'emprise ou non)
+                folium.CircleMarker(
+                    location=(la, lo),
+                    radius=7,
+                    color="orange",
+                    fill=True,
+                    fill_opacity=0.95,
+                    tooltip=_lab or "Arrêt temporaire"
+                ).add_to(m)
+
+    # Si l'emprise tombe à un seul point (très rare), force un zoom local
+    if len(bounds_pts) == 1:
+        m.location = bounds_pts[0]
+        m.options.update({"zoom": 15})
+    else:
+        # Center & zoom sur l'emprise retenue (polyline + stops à proximité)
+        m.fit_bounds(bounds_pts, padding=(30, 30))
+
     return m
 
 # 9) Cache — fonctions étagées + hash rapide
