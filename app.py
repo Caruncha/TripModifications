@@ -11,15 +11,12 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple, Set
 from pathlib import Path
 
-# Affichages tabulaires
 import pandas as pd
-
-# Carte
 import folium
 from streamlit_folium import st_folium
 
-# --- Version de schéma (invalide proprement cache/session si on change la structure) ---
-SCHEMA_VERSION = "2025-10-18-layered-cache-v4-plain-returns"
+# --- Version de schéma (invalide cache data si on change la structure de sortie) ---
+SCHEMA_VERSION = "2025-10-18-resource-data-split-v1"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -56,6 +53,7 @@ class StopSelector:
 class ReplacementStop:
     stop_id: str
     travel_time_to_stop: int = 0
+
 @dataclass
 class Modification:
     start_stop_selector: Optional[StopSelector] = None
@@ -410,6 +408,7 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> Tuple[List[TripModEntity
             else:
                 shape_buf['encoded_polyline'] = shape_buf.get('encoded_polyline', '') + line
                 continue
+
         if line.startswith('entity') or line.startswith('id '):
             new_id = None
             if line.startswith('id '):
@@ -494,6 +493,7 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> Tuple[List[TripModEntity
                     )
                 continue
             continue
+
         if in_shape:
             if line.startswith('shape_id '):
                 shape_buf['shape_id'] = line[len('shape_id '):].strip()
@@ -665,7 +665,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
         ))
     return reports, totals
 
-# 8) Visualisation Folium (centrage sûr + arrêts temporaires orange)
+# 8) Folium — centrage sûr + arrêts temporaires orange
 def build_folium_map_for_polyline(
     poly: List[Tuple[float, float]],
     shape_id: Optional[str] = None,
@@ -673,11 +673,6 @@ def build_folium_map_for_polyline(
     montreal_center: Tuple[float, float] = (45.5017, -73.5673),
     zoom_start: int = 12
 ):
-    """
-    Centre d'abord sur la polyline (détour), puis inclut uniquement les arrêts temporaires
-    proches pour le calcul d'emprise (tous les arrêts restent affichés en orange).
-    """
-
     def _valid_ll(la, lo) -> bool:
         return (la is not None and lo is not None and
                 -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0 and
@@ -697,7 +692,6 @@ def build_folium_map_for_polyline(
         min_zoom=8
     )
 
-    # Tracé + départ/arrivée
     folium.PolyLine(
         locations=latlons_poly,
         color="#1f77b4",
@@ -710,7 +704,6 @@ def build_folium_map_for_polyline(
     folium.CircleMarker(latlons_poly[-1], radius=6, color="red",
                         fill=True, fill_opacity=0.9, tooltip="Arrivée").add_to(m)
 
-    # Emprise basée sur la polyline
     lats = [la for la, _ in latlons_poly]
     lons = [lo for _, lo in latlons_poly]
     min_lat, max_lat = min(lats), max(lats)
@@ -722,7 +715,6 @@ def build_folium_map_for_polyline(
 
     bounds_pts: List[Tuple[float, float]] = latlons_poly.copy()
 
-    # Ajoute uniquement les arrêts temporaires "proches" pour l'emprise
     if replacement_stop_points:
         min_lat_ext = min_lat - pad_lat
         max_lat_ext = max_lat + pad_lat
@@ -731,7 +723,6 @@ def build_folium_map_for_polyline(
 
         for la, lo, lab in replacement_stop_points:
             if _valid_ll(la, lo):
-                # Marqueur (toujours affiché)
                 folium.CircleMarker(
                     location=(la, lo),
                     radius=7,
@@ -740,11 +731,9 @@ def build_folium_map_for_polyline(
                     fill_opacity=0.95,
                     tooltip=lab or "Arrêt temporaire"
                 ).add_to(m)
-                # Inclus dans l'emprise seulement si proche
                 if (min_lat_ext <= la <= max_lat_ext) and (min_lon_ext <= lo <= max_lon_ext):
                     bounds_pts.append((la, lo))
 
-    # Centrage final
     if len(bounds_pts) == 1:
         m.location = bounds_pts[0]
         m.options.update({"zoom": 15})
@@ -753,36 +742,39 @@ def build_folium_map_for_polyline(
 
     return m
 
-# 9) Cache — fonctions étagées + hash rapide (retours JSON‑compatibles)
+# 9) CACHE — split resource/data (évite la sérialisation d’objets lourds)
 def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
-@st.cache_data(show_spinner=True, ttl=86400, max_entries=64, hash_funcs={bytes: _hash_bytes})
-def cache_parse_tripmods(tripmods_bytes: bytes, decode_flag: str, schema: str):
+@st.cache_resource(show_spinner=True)
+def resource_parse_tripmods(tripmods_bytes: bytes, decode_flag: str):
     ents, feed_json, rt_shapes = load_tripmods_bytes(tripmods_bytes, decode_mode=decode_flag)
-    needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
-    # On retourne des types simples dans le cache (on garde quand même ents/rt_shapes sous forme d'objets pour l'étape suivante)
-    return ents, feed_json, rt_shapes, sorted(needed_trip_ids), sorted(needed_stop_ids)
+    return ents, feed_json, rt_shapes
 
-@st.cache_data(show_spinner=True, ttl=86400, max_entries=64, hash_funcs={bytes: _hash_bytes})
-def cache_load_gtfs(gtfs_bytes: bytes, needed_trip_ids_sorted: List[str], needed_stop_ids_sorted: List[str], schema: str):
+@st.cache_resource(show_spinner=True)
+def resource_load_gtfs(gtfs_bytes: bytes, needed_trip_ids_sorted: Tuple[str, ...], needed_stop_ids_sorted: Tuple[str, ...]):
     gtfs = load_gtfs_zip_filtered_bytes(gtfs_bytes, set(needed_trip_ids_sorted), set(needed_stop_ids_sorted))
     return gtfs
 
-@st.cache_data(show_spinner=True, ttl=86400, max_entries=64)
-def cache_analyze_and_prepare_views(
-    ents: List[TripModEntity],
-    rt_shapes: RtShapes,
-    gtfs: GtfsStatic,
-    schema: str
-) -> Dict[str, Any]:
-    # 1) Analyse “métier”
+@st.cache_data(show_spinner=True, ttl=86400, max_entries=32, hash_funcs={bytes: _hash_bytes})
+def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, schema: str) -> Dict[str, Any]:
+    # 1) Parse TripMods (resource cache)
+    ents, feed_json, rt_shapes = resource_parse_tripmods(tripmods_bytes, decode_flag)
+    needed_trip_ids, needed_stop_ids = compute_needed_sets(ents)
+    tid_sorted = tuple(sorted(needed_trip_ids))
+    sid_sorted = tuple(sorted(needed_stop_ids))
+
+    # 2) GTFS filtré (resource cache)
+    gtfs = resource_load_gtfs(gtfs_bytes, tid_sorted, sid_sorted)
+
+    # 3) Analyse (retours dataclasses → convertis en dicts)
     reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
+    reports_plain = [asdict(r) for r in reports]
     total_shapes = len(rt_shapes.shapes)
 
-    # 2) Préparation des vues “Détails” — uniquement des structures JSON‑compatibles
+    # 4) Prépare les vues "Détails" (tout JSON‑compatible)
     details_tables_by_entity: Dict[str, List[Dict[str, Any]]] = {}
-    temp_stops_points_by_entity: Dict[str, List[List[Any]]] = {}  # liste de [lat, lon, label]
+    temp_stops_points_by_entity: Dict[str, List[List[Any]]] = {}
     shape_for_plot_by_entity: Dict[str, Optional[str]] = {}
 
     def _is_poly_anormal(coords: List[Tuple[float,float]]) -> bool:
@@ -792,20 +784,17 @@ def cache_analyze_and_prepare_views(
 
     stops_info = getattr(gtfs, "stops_info", {}) or {}
 
-    # On convertit aussi les 'reports' (dataclasses) en dicts plats
-    reports_plain: List[Dict[str, Any]] = [asdict(r) for r in reports]
-
-    # Pré‑calcul par entité (diagnostics)
     for r in reports:
         ent_id = r.entity_id
         ent_obj = next((e for e in ents if e.entity_id == ent_id), None)
         if not ent_obj or not ent_obj.modifications:
             continue
+
         shape_ids_in_entity = [s.shape_id for s in ent_obj.selected_trips if s.shape_id]
         shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
         shape_for_plot_by_entity[ent_id] = shape_id_for_plot
 
-        # Comptage des trips dupliqués
+        # comptage trips dupliqués
         trip_counts: Dict[str, int] = {}
         for s in ent_obj.selected_trips:
             for tid in s.trip_ids:
@@ -813,13 +802,11 @@ def cache_analyze_and_prepare_views(
 
         mixed_shapes = len({sid for sid in shape_ids_in_entity if sid}) > 1
 
-        # Lignes de diagnostic (tableau)
+        # tableau diagnostics
         detail_rows: List[Dict[str, Any]] = []
         for t in r.trips:
             st_list = gtfs.stop_times.get(t.trip_id, [])
             stop_times_count = len(st_list)
-
-            # shape_id associé à ce trip (dans le contexte entité)
             trip_shape_id = None
             for s in ent_obj.selected_trips:
                 if t.trip_id in s.trip_ids and s.shape_id:
@@ -827,11 +814,9 @@ def cache_analyze_and_prepare_views(
                     break
             if not trip_shape_id and shape_ids_in_entity:
                 trip_shape_id = shape_ids_in_entity[0]
-
             poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
             poly_points = len(poly)
             poly_anormal = _is_poly_anormal(poly)
-
             selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
             ordre_ok = ""
             ecart_seq = ""
@@ -839,7 +824,6 @@ def cache_analyze_and_prepare_views(
                 ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
                 ecart_seq = t.end_seq - t.start_seq
             duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
-
             detail_rows.append({
                 "trip_id": t.trip_id,
                 "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
@@ -847,7 +831,6 @@ def cache_analyze_and_prepare_views(
                 "end_seq": t.end_seq if t.end_seq is not None else "",
                 "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
                 "notes": "; ".join(t.notes) if t.notes else "",
-                # Anomalies / diagnostics
                 "shape_id (trip)": trip_shape_id or "",
                 "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
                 "pts polyline": poly_points,
@@ -859,10 +842,9 @@ def cache_analyze_and_prepare_views(
                 "trip en double (entité)": "oui" if duplicate_trip else "non",
                 "mixed shapes (entité)": "oui" if mixed_shapes else "non",
             })
-
         details_tables_by_entity[ent_id] = detail_rows
 
-        # Arrêts temporaires (orange) — uniques ; format liste pour JSON (pas tuples)
+        # points orange (liste [lat, lon, label])
         tmp_points: List[List[Any]] = []
         seen: Set[str] = set()
         for m in ent_obj.modifications:
@@ -876,33 +858,31 @@ def cache_analyze_and_prepare_views(
                     seen.add(sid)
         temp_stops_points_by_entity[ent_id] = tmp_points
 
-    return {
-        "reports": reports_plain,         # ← list[dict] (pas de dataclasses)
-        "totals": totals,                 # dict simple
-        "total_shapes": total_shapes,     # int
-        "details_tables_by_entity": details_tables_by_entity,              # dict[str, list[dict]]
-        "temp_stops_points_by_entity": temp_stops_points_by_entity,        # dict[str, list[list]]
-        "shape_for_plot_by_entity": shape_for_plot_by_entity,              # dict[str, str|None]
+    # 5) shapes → JSON‑compatibles (listes)
+    shapes_plain: Dict[str, List[List[float]]] = {
+        sid: [[la, lo] for (la, lo) in coords] for sid, coords in rt_shapes.shapes.items()
     }
 
-# Orchestrateur (une seule entrée lourde côté UI)
-@st.cache_data(show_spinner=True, ttl=86400, max_entries=32, hash_funcs={bytes: _hash_bytes})
-def run_full_analysis(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, schema: str) -> Dict[str, Any]:
-    ents, feed_json, rt_shapes, needed_trip_ids_sorted, needed_stop_ids_sorted = cache_parse_tripmods(
-        tripmods_bytes, decode_flag, schema
+    # KPI GTFS
+    gtfs_kpi = dict(
+        trips=len(gtfs.trips),
+        stop_times=sum(len(v) for v in gtfs.stop_times.values()),
+        stops_present=len(gtfs.stops_present),
     )
-    gtfs = cache_load_gtfs(gtfs_bytes, needed_trip_ids_sorted, needed_stop_ids_sorted, schema)
-    views = cache_analyze_and_prepare_views(ents, rt_shapes, gtfs, schema)
-    # On retourne uniquement des structures “data” + objets RT/GTFS nécessaires pour la carte
+
     return {
         "schema_version": schema,
-        "ents": ents,                     # objets (non stockés par st.session_state si tu veux éviter)
-        "rt_shapes": rt_shapes,           # objets
-        "gtfs": gtfs,                     # objets
-        "feed_json": feed_json,           # dict ou None
-        "needed_trip_ids": needed_trip_ids_sorted,
-        "needed_stop_ids": needed_stop_ids_sorted,
-        **views
+        "feed_json": feed_json,
+        "reports": reports_plain,
+        "totals": totals,
+        "total_shapes": total_shapes,
+        "needed_trip_ids": list(tid_sorted),
+        "needed_stop_ids": list(sid_sorted),
+        "details_tables_by_entity": details_tables_by_entity,
+        "temp_stops_points_by_entity": temp_stops_points_by_entity,
+        "shape_for_plot_by_entity": shape_for_plot_by_entity,
+        "shapes_plain": shapes_plain,
+        "gtfs_kpi": gtfs_kpi,
     }
 
 # 10) UI — formulaire + session_state (stable)
@@ -929,7 +909,7 @@ if submitted:
     else:
         tripmods_bytes = tripmods_file.getvalue()
         gtfs_bytes = gtfs_file.getvalue()
-        res = run_full_analysis(tripmods_bytes, gtfs_bytes, decode_flag, SCHEMA_VERSION)
+        res = cache_views(tripmods_bytes, gtfs_bytes, decode_flag, SCHEMA_VERSION)
         st.session_state["last_results"] = res
         st.session_state["last_params"] = dict(decode_flag=decode_flag, schema_version=SCHEMA_VERSION)
         st.success("Analyse terminée ✅")
@@ -945,16 +925,14 @@ if not res:
     st.caption("Astuce : si ta polyligne vient d’un JSON, elle doit être « déséchappée » (retrait des \\ et \\n).")
     st.stop()
 
-ents = res["ents"]; feed_json = res["feed_json"]; rt_shapes = res["rt_shapes"]; gtfs = res["gtfs"]
+feed_json = res["feed_json"]
 reports_plain = res["reports"]; totals = res["totals"]; total_shapes = res["total_shapes"]
 needed_trip_ids = res["needed_trip_ids"]; needed_stop_ids = res["needed_stop_ids"]
 details_tables_by_entity = res["details_tables_by_entity"]
 temp_stops_points_by_entity = res["temp_stops_points_by_entity"]
 shape_for_plot_by_entity = res["shape_for_plot_by_entity"]
-
-# Sécurité : s’assure que stops_info existe
-if not hasattr(gtfs, "stops_info") or gtfs.stops_info is None:
-    gtfs.stops_info = {}
+shapes_plain = res["shapes_plain"]
+gtfs_kpi = res["gtfs_kpi"]
 
 # KPIs
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
@@ -968,13 +946,14 @@ c7.metric("Shapes dans le feed", total_shapes)
 
 # Infos filtrage et comptages
 st.info(f"Filtrage GTFS → trips requis: {len(needed_trip_ids):,} · stops requis: {len(needed_stop_ids):,} · shapes disponibles: {total_shapes:,}")
-st.success(f"GTFS filtré : **{len(gtfs.trips):,} trips conservés**, **{sum(len(v) for v in gtfs.stop_times.values()):,} stop_times**, **{len(gtfs.stops_present):,} stops présents**")
-st.success(f"TripModifications : **{len(ents)} entités**")
+st.success(f"GTFS filtré : **{gtfs_kpi['trips']:,} trips conservés**, **{gtfs_kpi['stop_times']:,} stop_times**, **{gtfs_kpi['stops_present']:,} stops présents**")
+st.success(f"TripModifications : **{len(reports_plain)} entités**")
 
 # Aperçus optionnels
-if st.session_state.get("dump_first_cb") and ents:
+if st.session_state.get("dump_first_cb") and reports_plain:
     with st.expander("Aperçu du 1er trip_mod (normalisé)"):
-        st.json(asdict(ents[0]))
+        st.json(reports_plain[0])  # déjà dict
+
 if feed_json is not None:
     with st.expander("Aperçu brut du feed JSON (après normalisation camel→snake)"):
         st.json(feed_json)
@@ -994,10 +973,10 @@ st.dataframe(table, width="stretch", height=360)
 st.subheader("Détails")
 for r in reports_plain[:200]:
     ent_id = r["entity_id"]
-    # Afficher uniquement si l'entité a des modifications
-    ent_obj = next((e for e in ents if e.entity_id == ent_id), None)
-    if not ent_obj or not ent_obj.modifications:
+    # Afficher uniquement si l'entité a des modifications (déjà filtré côté parse/analyse normalement)
+    if r["modification_count"] <= 0:
         continue
+
     with st.expander(f"Entité {ent_id} — {r['total_selected_trip_ids']} trips — {r['modification_count']} modifications"):
         st.write("**Dates** :", ", ".join(r["service_dates"]) if r["service_dates"] else "—")
         st.write("**Replacement stops inconnus dans GTFS (peuvent être temporaires)** :",
@@ -1014,13 +993,16 @@ for r in reports_plain[:200]:
         shape_id_for_plot = shape_for_plot_by_entity.get(ent_id)
         st.write(f"**Shape utilisé pour le tracé** : {shape_id_for_plot or '—'}")
         if shape_id_for_plot:
-            poly = rt_shapes.shapes.get(shape_id_for_plot, [])
+            coords_list = shapes_plain.get(shape_id_for_plot, [])
+            poly = [(la, lo) for la, lo in coords_list]  # conversion list->tuple
             if poly and len(poly) >= 2:
-                # temp_stops_points_by_entity: liste de [lat, lon, label]
+                # points orange (liste [lat, lon, label] -> tuples)
+                tmp_pts = temp_stops_points_by_entity.get(ent_id, [])
+                tmp_pts_tuples = [(p[0], p[1], p[2]) for p in tmp_pts] if tmp_pts else []
                 fmap = build_folium_map_for_polyline(
                     poly,
                     shape_id=shape_id_for_plot,
-                    replacement_stop_points=temp_stops_points_by_entity.get(ent_id, [])
+                    replacement_stop_points=tmp_pts_tuples
                 )
                 if fmap is not None:
                     st_folium(fmap, height=440, width=None, key=f"map_{ent_id}")
