@@ -1,18 +1,18 @@
-# --- DOIT ÊTRE EN PREMIER ---
+
+from __future__ import annotations
+
 import streamlit as st
 st.set_page_config(
     page_title="Analyse TripModifications + GTFS — JSON/PB/Textproto + carte",
     layout="wide"
 )
-# ----------------------------
-
-from __future__ import annotations
 
 import json, csv, io, zipfile, sys, re
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Any, Dict, Tuple, Set
 from pathlib import Path
 import pandas as pd
+
 
 # Carte
 import folium
