@@ -748,7 +748,7 @@ def build_folium_map_for_polyline(
                 color="#2ca02c",  # vert
                 weight=4,
                 opacity=0.85,
-                tooltip="Tracé originel (shapes.txt)"
+                tooltip=f"Tracé originel (shapes.txt): {orig_shape_id or 'n/a'}",
             ).add_to(m)
 
     # Replacement stops (ROSE)
