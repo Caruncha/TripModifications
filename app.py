@@ -729,7 +729,7 @@ def build_folium_map_for_polyline(
     # Détour (BLEU)
     folium.PolyLine(
         locations=latlons_poly,
-        color="#0fffdf",
+        color="#f70707",
         weight=5,
         opacity=0.9,
         tooltip=f"shape_id (détour): {shape_id or 'n/a'}",
