@@ -1207,4 +1207,3 @@ st.download_button("📥 Télécharger le rapport JSON",
     data=json.dumps(export_json, ensure_ascii=False, indent=2),
     file_name="rapport_tripmods.json", mime="application/json"
 )
-``
