@@ -14,7 +14,7 @@ import folium
 import streamlit.components.v1 as components
 
 # --- Version de schéma (invalide caches et cartes quand la structure/version change) ---
-SCHEMA_VERSION = "2025-10-23-orig-stops-white-labels-v1"
+SCHEMA_VERSION = "2025-10-24-replstops-latlon-label-v1"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -48,7 +48,11 @@ class StopSelector:
 
 @dataclass
 class ReplacementStop:
-    stop_id: str
+    # Champs supportés par TripModifications pour un arrêt de remplacement
+    stop_id: Optional[str] = None
+    id: Optional[str] = None
+    stop_lat: Optional[float] = None
+    stop_lon: Optional[float] = None
     travel_time_to_stop: int = 0
 
 @dataclass
@@ -202,14 +206,31 @@ def _coerce_selector(obj: Dict[str, Any]) -> StopSelector:
         seq = None
     return StopSelector(stop_sequence=seq, stop_id=sid if (sid or None) else None)
 
+def _to_float(v) -> Optional[float]:
+    try:
+        if v is None: return None
+        s = str(v).strip()
+        if s == "": return None
+        return float(s)
+    except Exception:
+        return None
+
 def _coerce_repl_stop(obj: Dict[str, Any]) -> Optional[ReplacementStop]:
     if not isinstance(obj, dict): return None
     sid = obj.get('stop_id')
-    if not sid: return None
+    rid = obj.get('id')  # identifiant propre au replacement stop si présent
+    la = _to_float(obj.get('stop_lat'))
+    lo = _to_float(obj.get('stop_lon'))
     t = obj.get('travel_time_to_stop', 0)
     try: t = int(t)
     except Exception: t = 0
-    return ReplacementStop(stop_id=str(sid), travel_time_to_stop=t)
+    # stop_id peut être absent dans certains cas : on accepte quand même si lat/lon présents
+    if (sid is None) and (la is None or lo is None):
+        return None
+    return ReplacementStop(stop_id=str(sid) if sid is not None else None,
+                           id=str(rid) if rid not in (None, "") else None,
+                           stop_lat=la, stop_lon=lo,
+                           travel_time_to_stop=t)
 
 def _coerce_selected_trips(obj: Dict[str, Any]) -> SelectedTrips:
     trips = obj.get('trip_ids') or []
@@ -293,9 +314,32 @@ def parse_tripmods_protobuf(data: bytes) -> List[TripModEntity]:
         start_times = list(getattr(tm, 'start_times', []))
         mods: List[Modification] = []
         for m in getattr(tm, 'modifications', []):
-            repl = [ReplacementStop(stop_id=rs.stop_id,
-                                    travel_time_to_stop=int(getattr(rs, 'travel_time_to_stop', 0)))
-                    for rs in getattr(m, 'replacement_stops', [])]
+            repl: List[ReplacementStop] = []
+            for rs in getattr(m, 'replacement_stops', []):
+                # lecture robuste : certains champs peuvent ne pas exister
+                sid = getattr(rs, 'stop_id', None)
+                rid = getattr(rs, 'id', None) if hasattr(rs, 'id') else None
+                la = getattr(rs, 'stop_lat', None) if hasattr(rs, 'stop_lat') else None
+                lo = getattr(rs, 'stop_lon', None) if hasattr(rs, 'stop_lon') else None
+                try:
+                    la = float(la) if la is not None else None
+                except Exception:
+                    la = None
+                try:
+                    lo = float(lo) if lo is not None else None
+                except Exception:
+                    lo = None
+                tt = int(getattr(rs, 'travel_time_to_stop', 0)) if hasattr(rs, 'travel_time_to_stop') else 0
+                # On accepte lat/lon sans stop_id
+                if (sid is None) and (la is None or lo is None):
+                    continue
+                repl.append(ReplacementStop(
+                    stop_id=sid if sid is not None else None,
+                    id=rid if rid not in (None, "") else None,
+                    stop_lat=la, stop_lon=lo,
+                    travel_time_to_stop=tt
+                ))
+
             start_sel = StopSelector(
                 stop_sequence=getattr(m.start_stop_selector, 'stop_sequence', None) if hasattr(m, 'start_stop_selector') else None,
                 stop_id=getattr(m.start_stop_selector, 'stop_id', None) if hasattr(m, 'start_stop_selector') else None,
@@ -483,12 +527,42 @@ def parse_textproto_feed(b: bytes, decode_mode: str) -> Tuple[List[TripModEntity
                         replacement_stops=[]
                     ))
                 continue
+            # --- Champs replacement_stop (on affecte sur le dernier élément si présent)
             if line.startswith('stop_id '):
                 sid = line[len('stop_id '):].strip()
                 if tm_buf['modifications']:
-                    tm_buf['modifications'][-1].replacement_stops.append(
-                        ReplacementStop(stop_id=sid, travel_time_to_stop=0)
-                    )
+                    m = tm_buf['modifications'][-1]
+                    # nouvel objet si pas encore créé ou si le dernier a déjà un stop_id et lat/lon
+                    if not m.replacement_stops or (m.replacement_stops and m.replacement_stops[-1].stop_id is not None):
+                        m.replacement_stops.append(ReplacementStop())
+                    m.replacement_stops[-1].stop_id = sid
+                continue
+            if line.startswith('id ') and not line.startswith('id '):  # évite collision avec entité (déjà gérée)
+                pass  # sécurité ; ce cas ne sera pas atteint
+            # Pour être explicite, on gère ' id ' avec un espace précédent via regex simple
+            if re.match(r'(^|\s)id\s', line) and not line.startswith('id '):
+                # rare ; on ignore
+                continue
+            if line.startswith('id '):  # id du replacement stop
+                rid = line[len('id '):].strip()
+                if tm_buf['modifications'] and tm_buf['modifications'][-1].replacement_stops:
+                    tm_buf['modifications'][-1].replacement_stops[-1].id = rid
+                continue
+            if line.startswith('stop_lat '):
+                sla = line[len('stop_lat '):].strip()
+                la = None
+                try: la = float(sla) if sla != "" else None
+                except: la = None
+                if tm_buf['modifications'] and tm_buf['modifications'][-1].replacement_stops:
+                    tm_buf['modifications'][-1].replacement_stops[-1].stop_lat = la
+                continue
+            if line.startswith('stop_lon '):
+                slo = line[len('stop_lon '):].strip()
+                lo = None
+                try: lo = float(slo) if slo != "" else None
+                except: lo = None
+                if tm_buf['modifications'] and tm_buf['modifications'][-1].replacement_stops:
+                    tm_buf['modifications'][-1].replacement_stops[-1].stop_lon = lo
                 continue
             continue
 
@@ -686,6 +760,7 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
             for rs in m.replacement_stops:
                 sid = rs.stop_id
                 if sid and sid not in gtfs.stops_present:
+                    # ils peuvent être temporaires — on conserve l'info
                     repl_unknown.append(sid)
                     totals["unknown_replacement_stops"] += 1
         totals["total_trip_ids"] += tot_trip_ids
@@ -706,8 +781,8 @@ def build_folium_map_for_polyline(
     shape_id: Optional[str] = None,
     replacement_stop_points: Optional[List[Tuple[float, float, str]]] = None,
     original_poly: Optional[List[Tuple[float, float]]] = None,
-    original_stop_points: Optional[List[Tuple[float, float, str]]] = None,  # NEW
-    original_shape_id: Optional[str] = None,                                # NEW
+    original_stop_points: Optional[List[Tuple[float, float, str]]] = None,
+    original_shape_id: Optional[str] = None,
     montreal_center: Tuple[float, float] = (45.5017, -73.5673),
     zoom_start: int = 12
 ):
@@ -779,7 +854,7 @@ def build_folium_map_for_polyline(
                 tooltip=str(lab or "stop_id")
             ).add_to(m)
 
-    # Replacement stops (ROSE)
+    # Replacement stops (ROSE) — maintenant positionnés prioritairement via stop_lat/stop_lon
     if replacement_stop_points:
         for la, lo, lab in replacement_stop_points:
             if _valid_ll(la, lo):
@@ -882,7 +957,7 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
     original_poly_by_entity: Dict[str, List[List[float]]] = {}
     original_shape_id_by_entity: Dict[str, Optional[str]] = {}
 
-    # NEW: arrêts originels
+    # Arrêts originels
     original_stop_points_by_entity: Dict[str, List[List[Any]]] = {}  # [[lat, lon, stop_id], ...]
     original_stop_ids_by_entity: Dict[str, List[str]] = {}           # [stop_id, ...]
 
@@ -968,18 +1043,27 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
 
         details_tables_by_entity[ent_id] = detail_rows
 
-        # Replacement stops (ROSE)
+        # Replacement stops (ROSE) — priorité aux stop_lat/stop_lon du feed, sinon fallback GTFS
         tmp_points: List[List[Any]] = []
-        seen: Set[str] = set()
+        seen_keys: Set[Tuple[float, float, str]] = set()
         for m in ent_obj.modifications:
             for rs in m.replacement_stops:
-                sid = rs.stop_id
-                if not sid or sid in seen:
+                label = (rs.id or rs.stop_id or "").strip()
+                # 1) coordonnées du TripModifications si dispo
+                la = rs.stop_lat
+                lo = rs.stop_lon
+                # 2) fallback sur stops.txt si stop_id et coordonnées manquantes
+                if (la is None or lo is None) and rs.stop_id:
+                    info = stops_info.get(rs.stop_id)
+                    if info:
+                        la = info.get("lat"); lo = info.get("lon")
+                if la is None or lo is None:
                     continue
-                info = stops_info.get(sid)
-                if info and "lat" in info and "lon" in info:
-                    tmp_points.append([info["lat"], info["lon"], f"{sid} — {info.get('name') or ''}".strip(" —")])
-                    seen.add(sid)
+                key = (round(la, 7), round(lo, 7), label)
+                if key in seen_keys:
+                    continue
+                tmp_points.append([la, lo, label if label else "replacement_stop"])
+                seen_keys.add(key)
         temp_stops_points_by_entity[ent_id] = tmp_points
 
         # Tracé originel (shapes.txt)
@@ -991,7 +1075,7 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
             original_poly_by_entity[ent_id] = []
             original_shape_id_by_entity[ent_id] = None
 
-        # NEW: Arrêts du tracé originel (via stop_times du trip choisi)
+        # Arrêts du tracé originel (via stop_times du trip choisi)
         orig_pts: List[List[Any]] = []
         orig_ids: List[str] = []
         if chosen_original_trip_id:
@@ -1032,12 +1116,11 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         "needed_trip_ids": list(tid_sorted),
         "needed_stop_ids": list(sid_sorted),
         "details_tables_by_entity": details_tables_by_entity,
-        "temp_stops_points_by_entity": temp_stops_points_by_entity,
-        "shape_for_plot_by_entity": shape_for_plot_by_entity,  # détour (RT)
-        "shapes_plain": shapes_plain,                           # détour (RT)
-        "original_poly_by_entity": original_poly_by_entity,     # originel (shapes.txt)
+        "temp_stops_points_by_entity": temp_stops_points_by_entity,   # <-- replacement stops (rose)
+        "shape_for_plot_by_entity": shape_for_plot_by_entity,         # détour (RT)
+        "shapes_plain": shapes_plain,                                  # détour (RT)
+        "original_poly_by_entity": original_poly_by_entity,            # originel (shapes.txt)
         "original_shape_id_by_entity": original_shape_id_by_entity,
-        # NEW
         "original_stop_points_by_entity": original_stop_points_by_entity,
         "original_stop_ids_by_entity": original_stop_ids_by_entity,
         "gtfs_kpi": gtfs_kpi,
@@ -1048,7 +1131,7 @@ st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Carte Folium
 st.caption(
     "Détour (rouge), tracé originel (vert, issu de shapes.txt), "
     "arrêts originels (blancs, avec départ en vert et terminus en rouge), "
-    "arrêts de remplacement (rose). "
+    "arrêts de remplacement (rose, positionnés avec stop_lat/stop_lon si fournis). "
     "Polylines nettoyées, analyse et diagnostics pré‑calculés et mis en cache. "
     "Carte HTML pré‑rendue et centrée strictement sur le détour."
 )
@@ -1089,13 +1172,13 @@ feed_json = res["feed_json"]
 reports_plain = res["reports"]; totals = res["totals"]; total_shapes = res["total_shapes"]
 needed_trip_ids = res["needed_trip_ids"]; needed_stop_ids = res["needed_stop_ids"]
 details_tables_by_entity = res["details_tables_by_entity"]
-temp_stops_points_by_entity = res["temp_stops_points_by_entity"]
+temp_stops_points_by_entity = res["temp_stops_points_by_entity"]  # replacement stops (rose)
 shape_for_plot_by_entity = res["shape_for_plot_by_entity"]
 shapes_plain = res["shapes_plain"]
 original_poly_by_entity = res["original_poly_by_entity"]
 original_shape_id_by_entity = res["original_shape_id_by_entity"]
-original_stop_points_by_entity = res["original_stop_points_by_entity"]  # NEW
-original_stop_ids_by_entity = res["original_stop_ids_by_entity"]        # NEW
+original_stop_points_by_entity = res["original_stop_points_by_entity"]
+original_stop_ids_by_entity = res["original_stop_ids_by_entity"]
 gtfs_kpi = res["gtfs_kpi"]
 
 # KPIs
@@ -1163,14 +1246,15 @@ for r in reports_plain[:200]:
                 # clés hashables et compactes
                 poly_key = tuple((round(la, 6), round(lo, 6)) for la, lo in poly)
 
+                # Replacement stops (rose) — points calculés en cache (priorité lat/lon du feed)
                 tmp_pts = temp_stops_points_by_entity.get(ent_id, [])
                 stops_key = tuple((round(p[0], 6), round(p[1], 6), str(p[2])) for p in tmp_pts)
 
+                # Tracé originel + arrêts originels
                 orig_list = original_poly_by_entity.get(ent_id, [])
                 orig_poly = [(float(la), float(lo)) for la, lo in orig_list]
                 original_poly_key = tuple((round(la, 6), round(lo, 6)) for la, lo in orig_poly) if orig_poly else tuple()
 
-                # NEW: points d'arrêts originels (blanc/vert/rouge)
                 orig_stop_pts = original_stop_points_by_entity.get(ent_id, [])
                 orig_stops_key = tuple((round(p[0], 6), round(p[1], 6), str(p[2])) for p in orig_stop_pts)
 
@@ -1180,13 +1264,13 @@ for r in reports_plain[:200]:
                     poly_key,
                     stops_key,
                     original_poly_key,
-                    orig_stops_key,            # NEW
-                    orig_shape_id or "",       # NEW
+                    orig_stops_key,
+                    orig_shape_id or "",
                     SCHEMA_VERSION
                 )
                 components.html(map_html, height=460, scrolling=False)
 
-                # NEW: liste ordonnée des stop_id du tracé originel
+                # Liste ordonnée des stop_id du tracé originel
                 if orig_stop_pts:
                     st.markdown("**Arrêts du tracé originel (ordre `stop_times`) :**")
                     ids_list = original_stop_ids_by_entity.get(ent_id, [])
