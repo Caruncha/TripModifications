@@ -1195,6 +1195,24 @@ c5.metric("selectors non résolus", totals["invalid_selectors"])
 c6.metric("repl. stops inconnus GTFS", totals["unknown_replacement_stops"])
 c7.metric("Shapes dans le feed (RT)", total_shapes)
 
+# --- AJOUT : liste des trip_id manquants (uniques)
+if totals.get("missing_trip_ids", 0) > 0:
+    missing = res.get("missing_trip_ids", [])
+    if missing:
+        with st.expander("🚫 Voir la liste des trip_id manquants (uniques)"):
+            st.write(f"**{len(missing)}** trip_id absents du GTFS (uniques).")
+            st.code("\n".join(missing), language="text")
+
+            # Option: export de la liste
+            st.download_button(
+                "⬇️ Télécharger la liste (TXT)",
+                data="\n".join(missing),
+                file_name="trip_ids_manquants.txt",
+                mime="text/plain"
+            )
+    else:
+        st.info("Des voyages sont manquants selon la KPI, mais la liste détaillée n'a pas été calculée. Relance l'analyse.")
+
 # Infos filtrage et comptages
 st.info(f"Filtrage GTFS → trips requis: {len(needed_trip_ids):,} · stops requis: {len(needed_stop_ids):,} · shapes RT disponibles: {total_shapes:,}")
 st.success(f"GTFS filtré : **{gtfs_kpi['trips']:,} trips**, **{gtfs_kpi['stop_times']:,} stop_times**, **{gtfs_kpi['stops_present']:,} stops**")
