@@ -944,6 +944,8 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
 
     # 2) GTFS filtré (resource)
     gtfs = resource_load_gtfs(gtfs_bytes, tid_sorted, sid_sorted, schema)
+    present_trip_ids = sorted(gtfs.trips.keys())
+    missing_trip_ids = sorted(set(tid_sorted) - set(present_trip_ids))
 
     # 3) Analyse (dataclasses → dicts)
     reports, totals = analyze_tripmods_with_gtfs(gtfs, ents)
@@ -1124,6 +1126,8 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         "original_stop_points_by_entity": original_stop_points_by_entity,
         "original_stop_ids_by_entity": original_stop_ids_by_entity,
         "gtfs_kpi": gtfs_kpi,
+        "present_trip_ids": present_trip_ids,
+        "missing_trip_ids": missing_trip_ids,
     }
 
 # 10) UI — formulaire + session_state
