@@ -1205,13 +1205,14 @@ if feed_json is not None:
         st.json(feed_json)
 
 # Synthèse par entité
+
 table = [{
     "entity_id": r["entity_id"],
     "trip_ids (sélectionnés)": r["total_selected_trip_ids"],
     "modifications": r["modification_count"],
     "service_dates": ", ".join(r["service_dates"]),
     "repl_stops inconnus": ", ".join(r["replacement_stops_unknown_in_gtfs"]) if r["replacement_stops_unknown_in_gtfs"] else ""
-} for r in reports_plain]
+} for r in reports_plain if r.get("modification_count", 0) > 0]
 st.subheader("Synthèse par entité")
 st.dataframe(table, width="stretch", height=360)
 
