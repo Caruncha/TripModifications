@@ -13,7 +13,7 @@ import folium
 import streamlit.components.v1 as components
 
 # --- Version de schéma (invalide caches et cartes quand la structure/version change) ---
-SCHEMA_VERSION = "2025-10-24-rt-shape-fallback-decode-tolerant-v1"
+SCHEMA_VERSION = "2025-10-24-rt-shape-fallback-decode-tolerant-v2"
 
 # 0) Import protobuf local si dispo (gtfs_realtime_pb2.py)
 ROOT = Path(__file__).resolve().parent
@@ -997,16 +997,16 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
     stops_info = getattr(gtfs, "stops_info", {}) or {}
     shapes_pts = getattr(gtfs, "shapes_points", {}) or {}
 
-    for r in reports:
-        ent_id = r["entity_id"]
+    for r in reports:  # <-- r est un EntityReport (dataclass)
+        ent_id = r.entity_id
         ent_obj = next((e for e in ents if e.entity_id == ent_id), None)
         if not ent_obj or not ent_obj.modifications:
             continue
 
-        # shape_ids côté entité
+        # shape_ids côté entité (SelectedTrips dataclasses)
         shape_ids_in_entity = [s.shape_id for s in ent_obj.selected_trips if s.shape_id]
 
-        # Tableau diagnostics
+        # Diagnostic table
         trip_counts: Dict[str, int] = {}
         for s in ent_obj.selected_trips:
             for tid in s.trip_ids:
@@ -1018,14 +1018,14 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         chosen_original_shape_id: Optional[str] = None
         chosen_original_trip_id: Optional[str] = None
 
-        for t in r["trips"]:
-            st_list = gtfs.stop_times.get(t["trip_id"], [])
+        for t in r.trips:  # <-- t est un TripCheck (dataclass)
+            st_list = gtfs.stop_times.get(t.trip_id, [])
             stop_times_count = len(st_list)
 
             # shape_id (RT) côté entité (pour ligne de diagnostic)
             trip_shape_id = None
             for s in ent_obj.selected_trips:
-                if t["trip_id"] in s.trip_ids and s.shape_id:
+                if t.trip_id in s.trip_ids and s.shape_id:
                     trip_shape_id = s.shape_id
                     break
             if not trip_shape_id and shape_ids_in_entity:
@@ -1034,21 +1034,21 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
             poly = rt_shapes.shapes.get(trip_shape_id, []) if trip_shape_id else []
             poly_points = len(poly)
             poly_anormal = _is_poly_anormal(poly)
-            selectors_incomplets = not (t["start_seq_valid"] and t["end_seq_valid"])
+            selectors_incomplets = not (t.start_seq_valid and t.end_seq_valid)
             ordre_ok = ""
             ecart_seq = ""
-            if (t.get("start_seq") is not None) and (t.get("end_seq") is not None):
-                ordre_ok = "oui" if t["start_seq"] <= t["end_seq"] else "non"
-                ecart_seq = t["end_seq"] - t["start_seq"]
-            duplicate_trip = trip_counts.get(t["trip_id"], 0) > 1
+            if (t.start_seq is not None) and (t.end_seq is not None):
+                ordre_ok = "oui" if t.start_seq <= t.end_seq else "non"
+                ecart_seq = t.end_seq - t.start_seq
+            duplicate_trip = trip_counts.get(t.trip_id, 0) > 1
 
             detail_rows.append({
-                "trip_id": t["trip_id"],
-                "existe dans GTFS": "oui" if t["exists_in_gtfs"] else "non",
-                "start_seq": t.get("start_seq") if t.get("start_seq") is not None else "",
-                "end_seq": t.get("end_seq") if t.get("end_seq") is not None else "",
-                "selectors OK": "oui" if (t["start_seq_valid"] and t["end_seq_valid"]) else "non",
-                "notes": "; ".join(t.get("notes") or []) if t.get("notes") else "",
+                "trip_id": t.trip_id,
+                "existe dans GTFS": "oui" if t.exists_in_gtfs else "non",
+                "start_seq": t.start_seq if t.start_seq is not None else "",
+                "end_seq": t.end_seq if t.end_seq is not None else "",
+                "selectors OK": "oui" if (t.start_seq_valid and t.end_seq_valid) else "non",
+                "notes": "; ".join(t.notes) if t.notes else "",
                 "shape_id (trip)": trip_shape_id or "",
                 "shape dispo": "oui" if (trip_shape_id and poly_points >= 2) else "non",
                 "pts polyline": poly_points,
@@ -1062,16 +1062,16 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
             })
 
             # sélection d'un trip avec tracé originel exploitable
-            if chosen_original_shape_id is None and t["exists_in_gtfs"]:
-                trip_row = gtfs.trips.get(t["trip_id"], {})
+            if chosen_original_shape_id is None and t.exists_in_gtfs:
+                trip_row = gtfs.trips.get(t.trip_id, {})
                 static_sid = (trip_row.get('shape_id') or '').strip()
                 if static_sid and static_sid in shapes_pts and len(shapes_pts.get(static_sid, [])) >= 2:
                     chosen_original_shape_id = static_sid
-                    chosen_original_trip_id = t["trip_id"]
+                    chosen_original_trip_id = t.trip_id
 
         details_tables_by_entity[ent_id] = detail_rows
 
-        # Replacement stops (ROSE) — priorité aux stop_lat/stop_lon du feed, sinon fallback GTFS
+        # Replacement stops (ROSE) — priorité stop_lat/stop_lon du feed, sinon fallback GTFS
         tmp_points: List[List[Any]] = []
         seen_keys: Set[Tuple[float, float, str]] = set()
         for m in ent_obj.modifications:
@@ -1121,7 +1121,7 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         original_stop_ids_by_entity[ent_id] = orig_ids
 
         # --- Sélection de la shape RT à afficher ---
-        # 1) priorité à selected_trips.shape_id présent et disponible dans rt_shapes
+        # 1) priorité à selected_trips.shape_id présent et dispo
         shape_id_for_plot = next((sid for sid in shape_ids_in_entity if sid in rt_shapes.shapes), None)
 
         # 2) FallBacks intelligents si rien trouvé
@@ -1151,7 +1151,7 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
 
         shape_for_plot_by_entity[ent_id] = shape_id_for_plot
 
-    # shapes (détour RT) → JSON‑compatibles (listes)
+    # shapes (détour RT) → JSON‑compatibles
     shapes_plain: Dict[str, List[List[float]]] = {
         sid: [[la, lo] for (la, lo) in coords] for sid, coords in rt_shapes.shapes.items()
     }
@@ -1172,10 +1172,10 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         "needed_trip_ids": list(tid_sorted),
         "needed_stop_ids": list(sid_sorted),
         "details_tables_by_entity": details_tables_by_entity,
-        "temp_stops_points_by_entity": temp_stops_points_by_entity,   # replacement stops (rose)
-        "shape_for_plot_by_entity": shape_for_plot_by_entity,         # détours RT
-        "shapes_plain": shapes_plain,                                  # détours RT
-        "original_poly_by_entity": original_poly_by_entity,            # originel (shapes.txt)
+        "temp_stops_points_by_entity": temp_stops_points_by_entity,
+        "shape_for_plot_by_entity": shape_for_plot_by_entity,
+        "shapes_plain": shapes_plain,
+        "original_poly_by_entity": original_poly_by_entity,
         "original_shape_id_by_entity": original_shape_id_by_entity,
         "original_stop_points_by_entity": original_stop_points_by_entity,
         "original_stop_ids_by_entity": original_stop_ids_by_entity,
