@@ -13,6 +13,9 @@ import pandas as pd
 import folium
 import streamlit.components.v1 as components
 
+import codecs
+_SANITIZE_WS_RE = re.compile(r"\s+")
+
 # --- Version de schéma (invalide caches et cartes quand la structure/version change) ---
 SCHEMA_VERSION = "2025-10-24-replstops-latlon-label-v1"
 
@@ -109,15 +112,21 @@ class RtShapes:
     shapes: Dict[str, List[Tuple[float, float]]]  # shape_id -> [(lat, lon), ...]
 
 # 3) Décodage polyline
-def _sanitize_polyline(s: str) -> str:
+
+def _sanitize_polyline_one(s: str) -> str:
+    """
+    Nettoyage minimal "non destructif" (1 seul candidat).
+    Conserve les backslashes (au cas où), retire espaces réels, \n, \r, \t littéraux.
+    """
     if not s:
         return s
     s = s.strip()
-    if "\\n" in s or "\\r" in s or "\\t" in s or "\\\\" in s:
-        s = s.replace("\\n", "").replace("\\r", "").replace("\\t", "")
-        s = s.replace("\\\\", "\\")
-        s = re.sub(r"\s+", "", s)
+    # retire les séquences littérales \n, \r, \t présentes telles quelles dans le texte
+    s = s.replace("\\n", "").replace("\\r", "").replace("\\t", "")
+    # retire les vrais espaces/blancs
+    s = _SANITIZE_WS_RE.sub("", s)
     return s
+
 
 def _legacy_decode_polyline(encoded: str) -> List[Tuple[float, float]]:
     coords = []
@@ -145,41 +154,101 @@ def _legacy_decode_polyline(encoded: str) -> List[Tuple[float, float]]:
 def _valid_coords(cs: List[Tuple[float,float]]) -> bool:
     return bool(cs) and all(-90 <= la <= 90 and -180 <= lo <= 180 for la, lo in cs)
 
+
 def decode_polyline(encoded: str, mode: str = "auto") -> List[Tuple[float, float]]:
-    enc = _sanitize_polyline(encoded)
-    if not enc:
-        return []
+    """
+    Décodeur tolérant :
+      - essaie plusieurs variantes de "dés-échappage"
+      - teste p5 puis p6 avec la lib 'polyline' si dispo
+      - fallback sur décodeur legacy
+      - choisit le meilleur candidat (span/nb points)
+    """
+    def is_valid_coords(cs: List[Tuple[float, float]]) -> bool:
+        return bool(cs) and all(-90 <= la <= 90 and -180 <= lo <= 180 for la, lo in cs)
+
+    def span_score(cs: List[Tuple[float, float]]) -> float:
+        # score combinant étendue et densité de points
+        if not cs:
+            return 0.0
+        lats = [la for la, _ in cs]
+        lons = [lo for _, lo in cs]
+        span = (max(lats) - min(lats)) + (max(lons) - min(lons))
+        return span + 1e-6 * len(cs)
+
+    # 1) Génère une liste de variantes candidates de la chaîne
+    base = encoded or ""
+    cands_str: List[str] = []
+    # a) brut + nettoyage simple
+    cands_str.append(base)
+    cands_str.append(_sanitize_polyline_one(base))
+    # b) collapse des doubles backslashes (ex: "\\\\n" -> "\\n"), puis nettoyage
+    cands_str.append(_sanitize_polyline_one(base.replace("\\\\", "\\")))
+    # c) dé-échappage unicode (transforme "\\n" -> vrai LF, "\\T" -> "T", etc.), puis nettoyage
+    try:
+        uni = codecs.decode(base, "unicode_escape")
+        cands_str.append(_sanitize_polyline_one(uni))
+    except Exception:
+        pass
+    # d) version "sans aucun backslash" (secours ultime quand \\ traînent)
+    cands_str.append(_SANITIZE_WS_RE.sub("", base).replace("\\", ""))
+    # e) idem après unicode_escape
+    try:
+        uni2 = codecs.decode(base, "unicode_escape")
+        cands_str.append(_SANITIZE_WS_RE.sub("", uni2).replace("\\", ""))
+    except Exception:
+        pass
+
+    # Déduplique en conservant l'ordre
+    seen = set()
+    cands_str = [c for c in cands_str if not (c in seen or seen.add(c)) and c]
+
+    # 2) Décode chaque candidat (p5/p6/lib polyline + legacy)
+    decoded_candidates: List[List[Tuple[float, float]]] = []
     try:
         import polyline as pl
     except Exception:
-        return _legacy_decode_polyline(enc)
+        pl = None  # si absent, on ira direct au legacy
 
-    if mode == "p5":
-        try:
-            c5 = pl.decode(enc, precision=5)
-            return c5 if _valid_coords(c5) else _legacy_decode_polyline(enc)
-        except Exception:
-            return _legacy_decode_polyline(enc)
-    if mode == "p6":
-        try:
-            c6 = pl.decode(enc, precision=6)
-            return c6 if _valid_coords(c6) else _legacy_decode_polyline(enc)
-        except Exception:
-            return _legacy_decode_polyline(enc)
+    def try_decode_one(txt: str) -> List[List[Tuple[float, float]]]:
+        outs: List[List[Tuple[float, float]]] = []
+        # ordre de tentatives selon le mode demandé
+        precisions = []
+        if mode == "p5":
+            precisions = [5]
+        elif mode == "p6":
+            precisions = [6]
+        else:
+            precisions = [5, 6]  # auto : essaie les deux
 
-    # auto
-    try: c5 = pl.decode(enc, precision=5)
-    except Exception: c5 = []
-    try: c6 = pl.decode(enc, precision=6)
-    except Exception: c6 = []
-    if _valid_coords(c5) and not _valid_coords(c6): return c5
-    if _valid_coords(c6) and not _valid_coords(c5): return c6
-    if _valid_coords(c5) and _valid_coords(c6):
-        def span(cs):
-            lats = [la for la,_ in cs]; lons = [lo for _,lo in cs]
-            return (max(lats)-min(lats)) + (max(lons)-min(lons))
-        return c6 if span(c6) > span(c5)*1.3 else c5
-    return _legacy_decode_polyline(enc)
+        if pl is not None:
+            for prec in precisions:
+                try:
+                    coords = pl.decode(txt, precision=prec)
+                    if is_valid_coords(coords):
+                        outs.append(coords)
+                except Exception:
+                    # ignore, on tentera le legacy
+                    pass
+        # fallback legacy (toujours en dernier)
+        try:
+            coords = _legacy_decode_polyline(txt)
+            if is_valid_coords(coords):
+                outs.append(coords)
+        except Exception:
+            pass
+        return outs
+
+    for s in cands_str:
+        outs = try_decode_one(s)
+        decoded_candidates.extend(outs)
+
+    # 3) Choisit le meilleur candidat selon un heuristique simple
+    if not decoded_candidates:
+        # échec total : retourne liste vide (l'appelant gérera)
+        return []
+    best = max(decoded_candidates, key=span_score)
+    return best
+
 
 # 4) Parsing TripMods & Shapes — JSON / PB / TEXTPROTO
 def _detect_tripmods_format_bytes(b: bytes) -> str:
