@@ -3,11 +3,12 @@ from __future__ import annotations
 import json, sys, re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from models import (
-    RtShapes, TripModEntity, SelectedTrips, ReplacementStop, StopSelector,
-    Modification
+
+from tripmodifications.models import (
+    RtShapes, TripModEntity, SelectedTrips, ReplacementStop, StopSelector, Modification
 )
-from polyline_utils import decode_polyline
+from tripmodifications.polyline_utils import decode_polyline
+
 
 # Option: proto local (préféré), sinon google.transit
 ROOT = Path(__file__).resolve().parent
@@ -477,4 +478,5 @@ def load_tripmods_bytes(file_bytes: bytes, decode_mode: str) -> Tuple[List[TripM
         shapes.shapes = {sid: poly for sid, poly in shapes.shapes.items() if sid in needed_shape_ids}
         shapes.added_segments = {sid: segs for sid, segs in shapes.added_segments.items() if sid in needed_shape_ids}
         shapes.canceled_segments = {sid: segs for sid, segs in shapes.canceled_segments.items() if sid in needed_shape_ids}
+
     return ents, None, shapes
