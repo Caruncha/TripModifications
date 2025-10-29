@@ -4,8 +4,9 @@ import json
 import streamlit as st
 import streamlit.components.v1 as components
 
-from config import SCHEMA_VERSION
-from caching import cache_views, resource_build_map_html
+from tripmodifications.caching import cache_views, resource_build_map_html
+from tripmodifications.config import SCHEMA_VERSION
+
 
 st.set_page_config(page_title="Analyse TripModifications + GTFS — JSON/PB/Textproto + carte", layout="wide")
 st.title("Analyse TripModifications (JSON/PB/Textproto) vs GTFS — Carte Folium")
@@ -179,4 +180,5 @@ export_json = {
 st.download_button("📥 Télécharger le rapport JSON",
     data=json.dumps(export_json, ensure_ascii=False, indent=2),
     file_name="rapport_tripmods.json", mime="application/json"
+
 )
