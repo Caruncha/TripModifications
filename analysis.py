@@ -1,8 +1,10 @@
 # analysis.py
 from typing import List, Dict, Tuple, Optional
-from models import (
+
+from tripmodifications.models import (
     TripModEntity, GtfsStatic, StopSelector, EntityReport, TripCheck
 )
+
 
 def compute_needed_sets(ents: List[TripModEntity]) -> Tuple[set[str], set[str]]:
     needed_trip_ids: set[str] = set()
@@ -80,4 +82,5 @@ def analyze_tripmods_with_gtfs(gtfs: GtfsStatic, ents: List[TripModEntity]) -> T
             replacement_stops_unknown_in_gtfs=sorted(set(repl_unknown))
         ))
     return reports, totals
+
 ``
