@@ -3,11 +3,13 @@ from dataclasses import asdict
 from typing import Dict, Any, Tuple, List
 import hashlib
 import streamlit as st
-from config import SCHEMA_VERSION
-from parsers import load_tripmods_bytes
-from analysis import compute_needed_sets, analyze_tripmods_with_gtfs
-from loaders_gtfs import load_gtfs_zip_filtered_bytes
-from map_view import build_folium_map_for_polyline
+
+from tripmodifications.analysis import compute_needed_sets, analyze_tripmods_with_gtfs
+from tripmodifications.loaders_gtfs import load_gtfs_zip_filtered_bytes
+from tripmodifications.parsers import load_tripmods_bytes
+from tripmodifications.map_view import build_folium_map_for_polyline
+from tripmodifications.config import SCHEMA_VERSION  # si utilisé quelque par
+
 
 def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
@@ -254,3 +256,4 @@ def cache_views(tripmods_bytes: bytes, gtfs_bytes: bytes, decode_flag: str, sche
         "present_trip_ids": present_trip_ids,
         "missing_trip_ids": missing_trip_ids,
     }
+
