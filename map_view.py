@@ -1,10 +1,12 @@
 # map_view.py
 from typing import List, Tuple, Optional
 import folium
-from config import (
+
+from tripmodifications.config import (
     COLOR_DETOUR, COLOR_ORIGINAL, COLOR_REPLACEMENT,
     COLOR_ADDED, COLOR_CANCELED, DEFAULT_CENTER, DEFAULT_ZOOM
 )
+
 
 def build_folium_map_for_polyline(
     poly: List[Tuple[float, float]],
@@ -97,4 +99,5 @@ def build_folium_map_for_polyline(
     sw = (min_lat - pad_lat, min_lon - pad_lon)
     ne = (max_lat + pad_lat, max_lon + pad_lon)
     m.fit_bounds([sw, ne], padding=(30, 30))
+
     return m
