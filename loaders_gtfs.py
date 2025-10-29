@@ -1,7 +1,7 @@
 # loaders_gtfs.py
 import csv, io, zipfile
 from typing import Dict, Set, Tuple, List
-from models import GtfsStatic
+from tripmodifications.models import GtfsStatic
 
 def load_gtfs_zip_filtered_bytes(zip_bytes: bytes, needed_trip_ids: Set[str], needed_stop_ids: Set[str]) -> GtfsStatic:
     trips: Dict[str, Dict[str, str]] = {}
@@ -84,4 +84,5 @@ def load_gtfs_zip_filtered_bytes(zip_bytes: bytes, needed_trip_ids: Set[str], ne
                 shapes_points[sid] = [(la, lo) for _, la, lo in rows]
 
     return GtfsStatic(trips=trips, stop_times=stop_times, stops_present=stops_present,
+
                       stops_info=stops_info, shapes_points=shapes_points)
